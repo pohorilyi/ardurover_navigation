@@ -10,12 +10,50 @@ ArduroverController::ArduroverController(rclcpp::Node &node, std::vector<Waypoin
     arming_ = node_.create_client<mavros_msgs::srv::CommandBool>("/mavros/cmd/arming");
     setMode_ = node_.create_client<mavros_msgs::srv::SetMode>("/mavros/set_mode");
     paramClient_ = std::make_shared<rclcpp::AsyncParametersClient>(&node_, "/mavros/setpoint_velocity");
+    stateSub_ = node_.create_subscription<mavros_msgs::msg::State>(
+        "/mavros/state", rclcpp::QoS(10).best_effort(),
+        [this](const mavros_msgs::msg::State &msg) { OnState(msg); }
+    );
+    velocityPublisher_ = node_.create_publisher<geometry_msgs::msg::TwistStamped>(
+        "/mavros/setpoint_velocity/cmd_vel", rclcpp::QoS(10).best_effort()
+    );
+}
+
+void ArduroverController::OnState(const mavros_msgs::msg::State &msg) {
+    state_ = msg;
+}
+
+void ArduroverController::RequestGuided() {
+    if (modeFuture_.valid() && modeFuture_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        return;
+    }
+    auto req = std::make_shared<mavros_msgs::srv::SetMode::Request>();
+    req->custom_mode = "GUIDED";
+    modeFuture_ = setMode_->async_send_request(req).future.share();
+}
+
+void ArduroverController::RequestArm() {
+    if (armFuture_.valid() && armFuture_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        return;
+    }
+    auto req = std::make_shared<mavros_msgs::srv::CommandBool::Request>();
+    req->value = true;
+    armFuture_ = arming_->async_send_request(req).future.share();
 }
 
 bool ArduroverController::SetupArdurover() {
+    if (setupState_ == SetupState::Ready && (!state_.armed || state_.mode != "GUIDED")) {
+        RCLCPP_WARN(
+            node_.get_logger(), "Left GUIDED/armed (mode=%s armed=%d), retrying", state_.mode.c_str(), state_.armed
+        );
+        setupState_ = SetupState::SetMode;
+        modeFuture_ = {};
+        armFuture_ = {};
+    }
+
     switch (setupState_) {
         case SetupState::WaitServices:
-            if (arming_->service_is_ready() && setMode_->service_is_ready()) {
+            if (arming_->service_is_ready() && setMode_->service_is_ready() && state_.connected) {
                 setupState_ = SetupState::SetFrame;
             }
             return false;
@@ -32,33 +70,19 @@ bool ArduroverController::SetupArdurover() {
             }
             return false;
         case SetupState::SetMode:
-            if (!modeFuture_.valid()) {
-                auto req = std::make_shared<mavros_msgs::srv::SetMode::Request>();
-                req->custom_mode = "GUIDED";
-                modeFuture_ = setMode_->async_send_request(req).future.share();
-            } else if (modeFuture_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            if (state_.mode == "GUIDED") {
                 setupState_ = SetupState::Arm;
+                return false;
             }
+            RequestGuided();
             return false;
         case SetupState::Arm:
-            if (!armFuture_.valid()) {
-                auto req = std::make_shared<mavros_msgs::srv::CommandBool::Request>();
-                req->value = true;
-                armFuture_ = arming_->async_send_request(req).future.share();
-                return false;
+            if (state_.armed) {
+                setupState_ = SetupState::Ready;
+                RCLCPP_INFO(node_.get_logger(), "Armed and GUIDED — controller running");
+                return true;
             }
-            if (armFuture_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
-                return false;
-            }
-            {
-                const auto resp = armFuture_.get();
-                if (resp && resp->success) {
-                    setupState_ = SetupState::Ready;
-                    RCLCPP_INFO(node_.get_logger(), "Controller running");
-                    return true;
-                }
-                armFuture_ = {};
-            }
+            RequestArm();
             return false;
         case SetupState::Ready:
             return true;
@@ -67,9 +91,11 @@ bool ArduroverController::SetupArdurover() {
 }
 
 void ArduroverController::Control(const nav_msgs::msg::Odometry & /*odometry*/) {
-    // Implement the control logic here.
-    // Feel free to modify the whole controller class as you see fit.
-    // You will need to figure out how to send the command to the flight controller through MAVROS
+    geometry_msgs::msg::TwistStamped cmd;
+    cmd.header.stamp = node_.now();
+    cmd.header.frame_id = "base_link";
+    cmd.twist.linear.x = 0.5;
+    velocityPublisher_->publish(cmd);
 }
 
 }  // namespace ardurover_nav
