@@ -13,7 +13,11 @@ export GZ_CONFIG_PATH="/usr/share/gz${GZ_CONFIG_PATH:+:$GZ_CONFIG_PATH}"
 export GZ_IP="${GZ_IP:-127.0.0.1}"
 export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
 export QT_X11_NO_MITSHM="${QT_X11_NO_MITSHM:-1}"
-if command -v nvidia-smi >/dev/null 2>&1; then
+# Native Linux NVIDIA GLX. WSL2 OpenGL goes through Mesa d3d12 (/dev/dxg), not libGLX_nvidia.
+if [[ -e /dev/dxg ]]; then
+  export GALLIUM_DRIVER="${GALLIUM_DRIVER:-d3d12}"
+  export MESA_D3D12_DEFAULT_ADAPTER_NAME="${MESA_D3D12_DEFAULT_ADAPTER_NAME:-NVIDIA}"
+elif command -v nvidia-smi >/dev/null 2>&1 && [[ "$(uname -r)" != *microsoft* ]]; then
   export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
   export __NV_PRIME_RENDER_OFFLOAD="${__NV_PRIME_RENDER_OFFLOAD:-1}"
 fi

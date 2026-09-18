@@ -107,7 +107,9 @@ RUN useradd -m -s /bin/bash ${USERNAME} \
     && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \
     && echo "source /opt/ros/jazzy/setup.bash" >> /home/${USERNAME}/.bashrc \
     && echo "[ -f ${WORKDIR}/install/setup.bash ] && source ${WORKDIR}/install/setup.bash" >> /home/${USERNAME}/.bashrc \
-    && echo "export ARDUROVER_NAV_ROOT=${WORKDIR}" >> /home/${USERNAME}/.bashrc
+    && echo "export ARDUROVER_NAV_ROOT=${WORKDIR}" >> /home/${USERNAME}/.bashrc \
+    && echo '[ -e /dev/dxg ] && export GALLIUM_DRIVER="${GALLIUM_DRIVER:-d3d12}"' >> /home/${USERNAME}/.bashrc \
+    && echo '[ -e /dev/dxg ] && export MESA_D3D12_DEFAULT_ADAPTER_NAME="${MESA_D3D12_DEFAULT_ADAPTER_NAME:-NVIDIA}"' >> /home/${USERNAME}/.bashrc
 
 ENV ARDUROVER_NAV_ROOT=${WORKDIR}
 ENV NVIDIA_VISIBLE_DEVICES=all
