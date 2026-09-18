@@ -1,5 +1,6 @@
 #pragma once
 
+#include <fstream>
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <mavros_msgs/msg/state.hpp>
 #include <mavros_msgs/srv/command_bool.hpp>
@@ -38,6 +39,8 @@ class ArduroverController {
     rclcpp::AsyncParametersClient::SharedPtr paramClient_;
     rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr stateSub_;
     rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr velocityPublisher_;
+    std::ofstream logFile_;
+    bool loggedGoal_{false};
 };
 
 }  // namespace ardurover_nav

@@ -22,6 +22,12 @@ inline double yaw_from_quat(const geometry_msgs::msg::Quaternion& q) {
     return std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
 }
 
+// Map an angle in radians to (-pi, pi]. Use on heading error so
+// 179 deg vs -179 deg is a small turn, not a full spin.
+inline double wrap(double a) {
+    return std::atan2(std::sin(a), std::cos(a));
+}
+
 inline std::vector<Waypoint> load_path(const std::string& file) {
     std::ifstream in(file);
     if (!in) {

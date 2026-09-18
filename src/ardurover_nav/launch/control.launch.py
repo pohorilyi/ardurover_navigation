@@ -25,6 +25,10 @@ def generate_launch_description() -> LaunchDescription:
         "output_file",
         default_value=os.path.join(WORKSPACE, "paths", "score.txt"),
     )
+    control_log_file = DeclareLaunchArgument(
+        "control_log_file",
+        default_value=os.path.join(WORKSPACE, "paths", "control.csv"),
+    )
 
     sim = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(PKG_SHARE, "launch", "sim.launch.py")),
@@ -35,7 +39,12 @@ def generate_launch_description() -> LaunchDescription:
         executable="trajectory_controller_node",
         name="trajectory_controller_node",
         output="screen",
-        parameters=[{"path_file": LaunchConfiguration("path_file")}],
+        parameters=[
+            {
+                "path_file": LaunchConfiguration("path_file"),
+                "control_log_file": LaunchConfiguration("control_log_file"),
+            }
+        ],
     )
     scorer = Node(
         package="ardurover_nav",
@@ -57,4 +66,4 @@ def generate_launch_description() -> LaunchDescription:
         output="screen",
     )
 
-    return LaunchDescription([gz_gui, path_file, output_file, sim, controller, scorer, rviz])
+    return LaunchDescription([gz_gui, path_file, output_file, control_log_file, sim, controller, scorer, rviz])
