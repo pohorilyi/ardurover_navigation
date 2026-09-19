@@ -1,7 +1,0 @@
-reason: goal_reached
-score: 94.1413
-completion: 0.96585
-rms_cross_track_m: 0.0105064
-max_cross_track_m: 0.0464691
-goal_reached: true
-samples: 1313
