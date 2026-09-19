@@ -41,6 +41,8 @@ class ArduroverController {
     rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr velocityPublisher_;
     std::ofstream logFile_;
     bool loggedGoal_{false};
+    bool finished_{false};       // latch: once at the finish, stay stopped (don't re-accelerate)
+    std::size_t progressIndex_{0};  // monotonic closest index; never snap back along the path
 };
 
 }  // namespace ardurover_nav
