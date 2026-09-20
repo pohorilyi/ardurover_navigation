@@ -35,4 +35,11 @@ install(TARGETS
 install(DIRECTORY launch rviz
   DESTINATION share/${PROJECT_NAME})
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_path_follow test/test_path_follow.cpp)
+  target_include_directories(test_path_follow PRIVATE include)
+  ament_target_dependencies(test_path_follow geometry_msgs)
+endif()
+
 ament_package()

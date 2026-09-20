@@ -43,6 +43,9 @@ class ArduroverController {
         geometry_msgs::msg::TwistStamped& cmd
     );
     void LeaveUnstick();
+    void UpdateCuspMode(const Waypoint& pose);
+    void BeginUnstickPhase(UnstickPhase phase, const Waypoint& pose, double tilt);
+    double SteerOffLip(double heading_error, double act_wz, double cte) const;
 
     rclcpp::Node& node_;
     std::vector<Waypoint> path_;
