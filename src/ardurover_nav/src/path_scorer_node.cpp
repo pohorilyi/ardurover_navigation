@@ -37,24 +37,35 @@ double cross_track(double px, double py, const std::vector<Waypoint>& path) {
     return best;
 }
 
-double path_length(const std::vector<Waypoint>& path) {
-    double length = 0.0;
+std::vector<double> cumulative_length(const std::vector<Waypoint>& path) {
+    std::vector<double> cum(path.size(), 0.0);
     for (size_t i = 1; i < path.size(); ++i) {
-        length += std::hypot(path[i].x - path[i - 1].x, path[i].y - path[i - 1].y);
+        cum[i] = cum[i - 1] + std::hypot(path[i].x - path[i - 1].x, path[i].y - path[i - 1].y);
     }
-    return length;
+    return cum;
 }
 
-double progress_along_path(double px, double py, const std::vector<Waypoint>& path) {
+// Closest point in [minS, maxS] along-track. A global nearest point snaps to
+// path.back() at 2-complicated's self-crossing (i=128 is 0.5 m from the end).
+double progress_in_window(
+    double px,
+    double py,
+    const std::vector<Waypoint>& path,
+    const std::vector<double>& cum,
+    double minS,
+    double maxS
+) {
     if (path.size() < 2) {
         return 0.0;
     }
-
+    minS = std::max(0.0, minS);
+    maxS = std::max(minS, maxS);
     double bestDist = std::numeric_limits<double>::infinity();
-    double bestProgress = 0.0;
-    double traveled = 0.0;
-
+    double bestProgress = minS;
     for (size_t i = 1; i < path.size(); ++i) {
+        if (cum[i] < minS || cum[i - 1] > maxS) {
+            continue;
+        }
         const double ax = path[i - 1].x;
         const double ay = path[i - 1].y;
         const double bx = path[i].x;
@@ -65,11 +76,11 @@ double progress_along_path(double px, double py, const std::vector<Waypoint>& pa
         const double length2 = abx * abx + aby * aby;
         const double t = (length2 < 1e-12) ? 0.0 : std::clamp(((px - ax) * abx + (py - ay) * aby) / length2, 0.0, 1.0);
         const double dist = std::hypot(px - (ax + t * abx), py - (ay + t * aby));
+        const double progress = std::clamp(cum[i - 1] + t * segLen, minS, maxS);
         if (dist < bestDist) {
             bestDist = dist;
-            bestProgress = traveled + t * segLen;
+            bestProgress = progress;
         }
-        traveled += segLen;
     }
     return bestProgress;
 }
@@ -89,7 +100,8 @@ class PathScorerNode : public rclcpp::Node {
         if (path_.empty()) {
             throw std::runtime_error("Path file is empty: " + pathFile_);
         }
-        pathLength_ = path_length(path_);
+        cum_ = cumulative_length(path_);
+        pathLength_ = cum_.empty() ? 0.0 : cum_.back();
 
         odomSub_ = create_subscription<nav_msgs::msg::Odometry>(
             "/ground_truth/odom", 10,
@@ -109,20 +121,19 @@ class PathScorerNode : public rclcpp::Node {
 
         double sumSq = 0.0;
         double maxCte = 0.0;
-        double maxProgress = 0.0;
         for (const auto& sample : samples_) {
             const double cte = cross_track(sample.first, sample.second, path_);
             sumSq += cte * cte;
             maxCte = std::max(maxCte, cte);
-            maxProgress = std::max(maxProgress, progress_along_path(sample.first, sample.second, path_));
         }
 
         const double rmsCte = samples_.empty() ? 0.0 : std::sqrt(sumSq / static_cast<double>(samples_.size()));
-        const double completion = pathLength_ < 1e-6 ? 0.0 : std::clamp(maxProgress / pathLength_, 0.0, 1.0);
+        const double completion = pathLength_ < 1e-6 ? 0.0 : std::clamp(maxProgress_ / pathLength_, 0.0, 1.0);
         const bool nearGoal =
             !samples_.empty() &&
             std::hypot(samples_.back().first - path_.back().x, samples_.back().second - path_.back().y) <= goalRadius_;
-        const bool goalReached = nearGoal && completion >= 0.8;
+        const bool atPathEnd = pathLength_ - maxProgress_ <= goalRadius_;
+        const bool goalReached = nearGoal && atPathEnd;
         const double score = 100.0 * completion * std::exp(-rmsCte / 0.75) * std::exp(-maxCte / 4.0);
 
         std::ofstream out(outputFile_);
@@ -158,10 +169,16 @@ class PathScorerNode : public rclcpp::Node {
         const double y = latestOdom_->pose.pose.position.y;
         samples_.emplace_back(x, y);
 
-        maxProgress_ = std::max(maxProgress_, progress_along_path(x, y, path_));
-        const double minProgress = std::min(2.0, 0.5 * pathLength_);
+        constexpr double kBackSlackM = 2.0;
+        constexpr double kAheadWindowM = 10.0;
+        const double progress =
+            progress_in_window(x, y, path_, cum_, maxProgress_ - kBackSlackM, maxProgress_ + kAheadWindowM);
+        maxProgress_ = std::max(maxProgress_, progress);
+        // Crow-flies to path.back() is true at 2-complicated's crossing (~64%).
+        // Require the rover to have actually walked the polyline to the end.
         const double goalDist = std::hypot(x - path_.back().x, y - path_.back().y);
-        if (goalDist <= goalRadius_ && maxProgress_ >= minProgress) {
+        const double remaining = std::max(0.0, pathLength_ - maxProgress_);
+        if (goalDist <= goalRadius_ && remaining <= goalRadius_) {
             ++goalTicks_;
         } else {
             goalTicks_ = 0;
@@ -187,6 +204,7 @@ class PathScorerNode : public rclcpp::Node {
     int goalTicks_{0};
     std::optional<rclcpp::Time> t0_;
     std::vector<Waypoint> path_;
+    std::vector<double> cum_;
     std::vector<std::pair<double, double>> samples_;
     nav_msgs::msg::Odometry::ConstSharedPtr latestOdom_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odomSub_;
