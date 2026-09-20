@@ -36,8 +36,8 @@ ArduroverController::ArduroverController(rclcpp::Node &node, std::vector<Waypoin
     } else {
         // reverse=1 and cmd_vx<0 means a real rollback; a jump in closest_i
         // with reverse=0 is the old nearest-XY snap onto the overlapping tail.
-        logFile_ << "t,x,y,yaw,act_vx,act_wz,closest_i,cte,target_x,target_y,dist_target,dist_goal,"
-                    "desired_yaw,heading_err,heading_err_deg,cmd_vx,cmd_wz,wz_sat,at_goal,reverse\n";
+        logFile_ << "t,x,y,yaw,roll,pitch,act_vx,act_wz,closest_i,cte,target_x,target_y,dist_target,dist_goal,"
+                    "desired_yaw,heading_err,heading_err_deg,cmd_vx,cmd_wz,wz_sat,at_goal,reverse,unstuck\n";
         RCLCPP_INFO(node_.get_logger(), "Control log: %s", logPath.c_str());
     }
 }
@@ -135,6 +135,27 @@ constexpr double kCuspApproachM = 1.5;  // bleed speed so we arrive at the verte
 constexpr double kReverseEndSlowM = 0.4;
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kRadToDeg = 180.0 / kPi;
+// Boardwalk hang: reverse to unhook, then a forward+yaw push while the bumper
+// is free. Leaving on reverse-distance alone rams the same lip (path 2 i=91).
+// GUIDED ramp-up also looks like act≈0 — wait until we have actually rolled.
+constexpr int kStuckDetectTicks = 30;       // 1.5 s still commanding and frozen
+constexpr int kUnstickMinTicks = 8;         // 0.4 s before a phase may end
+constexpr int kUnstickReverseTicks = 20;    // 1.0 s reverse to unhook
+constexpr int kUnstickDriveTicks = 36;      // 1.8 s forward push around the lip
+constexpr int kUnstickMaxAttempts = 4;      // reverse→drive cycles before giving up
+constexpr int kUnstickCooldownTicks = 30;   // 1.5 s before another unstick
+constexpr double kStuckCmdVx = 0.20;
+constexpr double kStuckCmdWz = 0.15;
+constexpr double kStuckActVx = 0.04;        // slow slide (0.06) is not a hang yet
+constexpr double kStuckActWz = 0.04;
+constexpr double kStuckPoseM = 0.04;
+constexpr double kUnstickReverseM = 0.22;   // unhook distance; then push forward
+constexpr double kUnstickDriveM = 0.40;     // leave only after a real forward gain
+constexpr double kUnstickReverseSpeed = 0.45;
+constexpr double kUnstickDriveSpeed = 0.55;
+constexpr double kSeenMotionVel = 0.20;     // have we ever really moved this run?
+constexpr double kTurnInPlaceRad = 0.85;    // |ψe| above this → vx=0 (do not drive off the curb)
+constexpr double kTiltRad = 0.10;           // ~6 deg: chassis on a lip (roll/pitch)
 
 double distance(const Waypoint &a, const Waypoint &b) {
     return std::hypot(a.x - b.x, a.y - b.y);
@@ -348,14 +369,164 @@ bool at_polyline_end(const std::vector<Waypoint> &path, std::size_t progress, do
     return progress + 1 == path.size() - 1 && t_on_seg >= 1.0 - kSegPastEps;
 }
 
+void ArduroverController::LeaveUnstick() {
+    const char *resume = preUnstickMode_ == DriveMode::Reverse ? "REV"
+                         : preUnstickMode_ == DriveMode::Turn  ? "TURN"
+                                                               : "FWD";
+    RCLCPP_INFO(node_.get_logger(), "Unstick done, resume %s", resume);
+    driveMode_ = preUnstickMode_;
+    unstickPhase_ = UnstickPhase::Reverse;
+    unstickTicks_ = 0;
+    stuckTicks_ = 0;
+    unstickAttempt_ = 0;
+    unstickCooldownTicks_ = kUnstickCooldownTicks;
+}
+
+void ArduroverController::RecoverStuck(
+    const Waypoint &pose,
+    double act_vx,
+    double act_wz,
+    double heading_error,
+    double cte,
+    double roll,
+    double pitch,
+    bool at_goal,
+    geometry_msgs::msg::TwistStamped &cmd
+) {
+    ++controlTicks_;
+    if (std::hypot(act_vx, act_wz) > kSeenMotionVel) {
+        seenMotion_ = true;
+    }
+    if (at_goal) {
+        stuckTicks_ = 0;
+        if (driveMode_ == DriveMode::Unstick) {
+            LeaveUnstick();
+        }
+        return;
+    }
+
+    const double tilt = std::hypot(roll, pitch);
+    auto steer_off_lip = [&]() {
+        double wz = std::clamp(kHeadingP * heading_error, -kMaxYawRate, kMaxYawRate);
+        if (std::abs(cte) > 0.15) {
+            const double toward_path = -std::copysign(kMaxYawRate, cte);
+            wz = 0.5 * wz + 0.5 * toward_path;
+            wz = std::clamp(wz, -kMaxYawRate, kMaxYawRate);
+        }
+        return wz;
+    };
+    auto begin_phase = [&](UnstickPhase phase) {
+        unstickPhase_ = phase;
+        unstickTicks_ = 0;
+        unstickStartX_ = pose.x;
+        unstickStartY_ = pose.y;
+        unstickLastTilt_ = tilt;
+    };
+
+    if (driveMode_ == DriveMode::Unstick) {
+        ++unstickTicks_;
+        const double moved = std::hypot(pose.x - unstickStartX_, pose.y - unstickStartY_);
+        const bool tilt_falling = tilt > kTiltRad && tilt + 0.015 < unstickLastTilt_;
+        unstickLastTilt_ = tilt;
+        cmd.twist.angular.z = steer_off_lip();
+
+        if (unstickPhase_ == UnstickPhase::Reverse) {
+            cmd.twist.linear.x = -kUnstickReverseSpeed;
+            const bool unhooked = unstickTicks_ >= kUnstickMinTicks && moved >= kUnstickReverseM;
+            const bool timed_out = unstickTicks_ >= kUnstickReverseTicks;
+            if (unhooked || timed_out) {
+                RCLCPP_INFO(
+                    node_.get_logger(),
+                    "Unstick: forward push (reversed %.2f m tilt=%.1f deg)",
+                    moved,
+                    tilt * kRadToDeg
+                );
+                begin_phase(UnstickPhase::Drive);
+                cmd.twist.linear.x = kUnstickDriveSpeed;
+            }
+            return;
+        }
+
+        cmd.twist.linear.x = kUnstickDriveSpeed;
+        if (unstickTicks_ >= kUnstickMinTicks && moved >= kUnstickDriveM) {
+            LeaveUnstick();
+            return;
+        }
+        // Tilt dropping means the chassis is coming down onto the path — keep
+        // the forward push instead of rocking back into reverse.
+        if (unstickTicks_ >= kUnstickDriveTicks && !tilt_falling) {
+            if (moved >= 0.12) {
+                LeaveUnstick();
+                return;
+            }
+            if (unstickAttempt_ + 1 >= kUnstickMaxAttempts) {
+                RCLCPP_WARN(
+                    node_.get_logger(), "Unstick gave up after %d cycles (moved %.2f m)", unstickAttempt_ + 1, moved
+                );
+                LeaveUnstick();
+                return;
+            }
+            ++unstickAttempt_;
+            RCLCPP_INFO(node_.get_logger(), "Unstick: reverse again (fwd moved %.2f m)", moved);
+            begin_phase(UnstickPhase::Reverse);
+            cmd.twist.linear.x = -kUnstickReverseSpeed;
+        }
+        return;
+    }
+
+    if (unstickCooldownTicks_ > 0) {
+        --unstickCooldownTicks_;
+        stuckTicks_ = 0;
+        return;
+    }
+    if (!seenMotion_) {
+        stuckTicks_ = 0;
+        return;
+    }
+
+    const bool commanding =
+        std::abs(cmd.twist.linear.x) > kStuckCmdVx || std::abs(cmd.twist.angular.z) > kStuckCmdWz;
+    const bool not_moving = std::abs(act_vx) < kStuckActVx && std::abs(act_wz) < kStuckActWz;
+    if (!commanding || !not_moving) {
+        stuckTicks_ = 0;
+        return;
+    }
+    if (stuckTicks_ == 0) {
+        stuckAnchorX_ = pose.x;
+        stuckAnchorY_ = pose.y;
+    }
+    if (std::hypot(pose.x - stuckAnchorX_, pose.y - stuckAnchorY_) > kStuckPoseM) {
+        stuckTicks_ = 0;
+        stuckAnchorX_ = pose.x;
+        stuckAnchorY_ = pose.y;
+        return;
+    }
+    ++stuckTicks_;
+    if (stuckTicks_ < kStuckDetectTicks) {
+        return;
+    }
+
+    const double tracking_vx = cmd.twist.linear.x;
+    const double tracking_wz = cmd.twist.angular.z;
+    preUnstickMode_ = driveMode_;
+    driveMode_ = DriveMode::Unstick;
+    unstickAttempt_ = 0;
+    stuckTicks_ = 0;
+    begin_phase(UnstickPhase::Reverse);
+    cmd.twist.linear.x = -kUnstickReverseSpeed;
+    cmd.twist.angular.z = steer_off_lip();
+    RCLCPP_INFO(
+        node_.get_logger(),
+        "Stuck (cmd vx=%.2f wz=%.2f act vx=%.2f wz=%.2f cte=%.2f tilt=%.1f deg) — reverse then forward",
+        tracking_vx, tracking_wz, act_vx, act_wz, cte, tilt * kRadToDeg
+    );
+}
+
 // One tick: step the current segment, start a cusp maneuver if we just
 // arrived at a fold, then steer with the carrot (or the Turn yaw target).
 void ArduroverController::Control(const nav_msgs::msg::Odometry &odometry) {
-    Waypoint current_waypoint{
-        odometry.pose.pose.position.x,
-        odometry.pose.pose.position.y,
-        yaw_from_quat(odometry.pose.pose.orientation)
-    };
+    const auto rpy = rpy_from_quat(odometry.pose.pose.orientation);
+    Waypoint current_waypoint{odometry.pose.pose.position.x, odometry.pose.pose.position.y, rpy.yaw};
 
     // Step along the current segment only. Never snap to a closer sample on an
     // overlapping reverse tail (that was the 136 → 156 jump on path 0).
@@ -408,8 +579,9 @@ void ArduroverController::Control(const nav_msgs::msg::Odometry &odometry) {
     const double track_t =
         (track_i + 1 < path_.size()) ? project_t(current_waypoint, path_[track_i], path_[track_i + 1]) : 1.0;
 
-    const bool reversing = driveMode_ == DriveMode::Reverse;
-    const bool turning = driveMode_ == DriveMode::Turn;
+    const DriveMode heading_mode = (driveMode_ == DriveMode::Unstick) ? preUnstickMode_ : driveMode_;
+    const bool reversing = heading_mode == DriveMode::Reverse;
+    const bool turning = heading_mode == DriveMode::Turn;
 
     // BODY_NED heading to the carrot. Reverse uses the same carrot on the
     // outgoing stretch, then subtracts π so we steer while backing instead of
@@ -475,21 +647,43 @@ void ArduroverController::Control(const nav_msgs::msg::Odometry &odometry) {
             }
         }
         const double turn_scale = turning ? 1.0 : 1.0 - (1.0 - kMinTurnSpeed) * turn;
-        const double speed = turning ? kTurnCreep : kCruiseSpeed * end_scale * turn_scale;
+        double speed = turning ? kTurnCreep : kCruiseSpeed * end_scale * turn_scale;
+        // After a hang the heading can be ~90°. Forward vx then drives off the
+        // pathwalk; spin (or the unstick rock) until the carrot is ahead.
+        if (!reversing && !turning && std::abs(heading_error) > kTurnInPlaceRad) {
+            speed = 0.0;
+        }
         cmd.twist.linear.x = (reversing ? -1.0 : 1.0) * speed;
         cmd.twist.angular.z = std::clamp(kHeadingP * heading_error, -kMaxYawRate, kMaxYawRate);
     }
+
+    RecoverStuck(
+        current_waypoint,
+        odometry.twist.twist.linear.x,
+        odometry.twist.twist.angular.z,
+        heading_error,
+        cte,
+        rpy.roll,
+        rpy.pitch,
+        at_goal,
+        cmd
+    );
+    const bool unstuck = driveMode_ == DriveMode::Unstick;
+    const int unstuck_code = !unstuck                                 ? 0
+                             : unstickPhase_ == UnstickPhase::Reverse ? 1
+                                                                      : 2;
     const bool wz_sat = !at_goal && std::abs(kHeadingP * heading_error) > kMaxYawRate + 1e-9;
 
     velocityPublisher_->publish(cmd);
 
     if (logFile_.is_open()) {
         logFile_ << std::fixed << std::setprecision(4) << node_.now().seconds() << ',' << current_waypoint.x << ','
-                 << current_waypoint.y << ',' << current_waypoint.yaw << ',' << odometry.twist.twist.linear.x << ','
-                 << odometry.twist.twist.angular.z << ',' << progressIndex_ << ',' << cte << ',' << target.x << ','
-                 << target.y << ',' << dist_target << ',' << dist_goal << ',' << desired_heading << ',' << heading_error
-                 << ',' << heading_error_deg << ',' << cmd.twist.linear.x << ',' << cmd.twist.angular.z << ',' << wz_sat
-                 << ',' << at_goal << ',' << (reversing ? 1 : 0) << '\n';
+                 << current_waypoint.y << ',' << current_waypoint.yaw << ',' << rpy.roll << ',' << rpy.pitch << ','
+                 << odometry.twist.twist.linear.x << ',' << odometry.twist.twist.angular.z << ',' << progressIndex_
+                 << ',' << cte << ',' << target.x << ',' << target.y << ',' << dist_target << ',' << dist_goal << ','
+                 << desired_heading << ',' << heading_error << ',' << heading_error_deg << ',' << cmd.twist.linear.x
+                 << ',' << cmd.twist.angular.z << ',' << wz_sat << ',' << at_goal << ',' << (reversing ? 1 : 0) << ','
+                 << unstuck_code << '\n';
         logFile_.flush();
     }
 
@@ -504,12 +698,17 @@ void ArduroverController::Control(const nav_msgs::msg::Odometry &odometry) {
         return;
     }
 
-    const char *mode = reversing ? " REV" : turning ? " TURN" : "";
+    const char *mode = unstuck                                      ? (unstickPhase_ == UnstickPhase::Reverse ? " UNSTICK-REV"
+                                                                                                             : " UNSTICK-FWD")
+                       : reversing                                  ? " REV"
+                       : turning                                    ? " TURN"
+                                                                    : "";
     RCLCPP_INFO_THROTTLE(
         node_.get_logger(), *node_.get_clock(), 500,
-        "i=%zu cte=%.3f m  he=%.1f deg  cmd vx=%.2f wz=%.2f%s%s  act vx=%.2f wz=%.2f  d_la=%.2f remain=%.2f",
-        progressIndex_, cte, heading_error_deg, cmd.twist.linear.x, cmd.twist.angular.z, mode, wz_sat ? " SAT" : "",
-        odometry.twist.twist.linear.x, odometry.twist.twist.angular.z, dist_target, remaining
+        "i=%zu cte=%.3f m  he=%.1f deg  r=%.1f p=%.1f  cmd vx=%.2f wz=%.2f%s%s  act vx=%.2f wz=%.2f  d_la=%.2f remain=%.2f",
+        progressIndex_, cte, heading_error_deg, rpy.roll * kRadToDeg, rpy.pitch * kRadToDeg, cmd.twist.linear.x,
+        cmd.twist.angular.z, mode, wz_sat ? " SAT" : "", odometry.twist.twist.linear.x, odometry.twist.twist.angular.z,
+        dist_target, remaining
     );
 }
 

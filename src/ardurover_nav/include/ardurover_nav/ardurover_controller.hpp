@@ -24,11 +24,25 @@ class ArduroverController {
     enum class SetupState { WaitServices, SetFrame, Prime, SetMode, Arm, Ready };
     // Forward = carrot / pure-pursuit. Reverse and Turn are discrete cusp maneuvers,
     // not something we infer from a carrot that may already sit on an overlapping tail.
-    enum class DriveMode { Forward, Reverse, Turn };
+    // Unstick is physics recovery (boardwalk lip): reverse to unhook, then drive.
+    enum class DriveMode { Forward, Reverse, Turn, Unstick };
+    enum class UnstickPhase { Reverse, Drive };
 
     void OnState(const mavros_msgs::msg::State& msg);
     void RequestGuided();
     void RequestArm();
+    void RecoverStuck(
+        const Waypoint& pose,
+        double act_vx,
+        double act_wz,
+        double heading_error,
+        double cte,
+        double roll,
+        double pitch,
+        bool at_goal,
+        geometry_msgs::msg::TwistStamped& cmd
+    );
+    void LeaveUnstick();
 
     rclcpp::Node& node_;
     std::vector<Waypoint> path_;
@@ -48,6 +62,19 @@ class ArduroverController {
     std::size_t progressIndex_{0};  // start of the current segment; only ++ when projection t > 1
     DriveMode driveMode_{DriveMode::Forward};
     double turnTargetYaw_{0.0};     // recorded yaw after a heading-180 cusp (Turn mode)
+    DriveMode preUnstickMode_{DriveMode::Forward};
+    UnstickPhase unstickPhase_{UnstickPhase::Reverse};
+    int controlTicks_{0};
+    int stuckTicks_{0};
+    int unstickTicks_{0};
+    int unstickCooldownTicks_{0};
+    int unstickAttempt_{0};
+    bool seenMotion_{false};
+    double stuckAnchorX_{0.0};
+    double stuckAnchorY_{0.0};
+    double unstickStartX_{0.0};
+    double unstickStartY_{0.0};
+    double unstickLastTilt_{0.0};
 };
 
 }  // namespace ardurover_nav
