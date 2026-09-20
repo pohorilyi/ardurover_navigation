@@ -22,6 +22,9 @@ class ArduroverController {
 
   private:
     enum class SetupState { WaitServices, SetFrame, Prime, SetMode, Arm, Ready };
+    // Forward = carrot / pure-pursuit. Reverse and Turn are discrete cusp maneuvers,
+    // not something we infer from a carrot that may already sit on an overlapping tail.
+    enum class DriveMode { Forward, Reverse, Turn };
 
     void OnState(const mavros_msgs::msg::State& msg);
     void RequestGuided();
@@ -41,8 +44,10 @@ class ArduroverController {
     rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr velocityPublisher_;
     std::ofstream logFile_;
     bool loggedGoal_{false};
-    bool finished_{false};       // latch: once at the finish, stay stopped (don't re-accelerate)
-    std::size_t progressIndex_{0};  // monotonic closest index; never snap back along the path
+    bool finished_{false};          // latch: once at the finish, stay stopped (don't re-accelerate)
+    std::size_t progressIndex_{0};  // start of the current segment; only ++ when projection t > 1
+    DriveMode driveMode_{DriveMode::Forward};
+    double turnTargetYaw_{0.0};     // recorded yaw after a heading-180 cusp (Turn mode)
 };
 
 }  // namespace ardurover_nav

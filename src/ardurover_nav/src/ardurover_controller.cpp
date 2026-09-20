@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace ardurover_nav {
@@ -33,8 +34,10 @@ ArduroverController::ArduroverController(rclcpp::Node &node, std::vector<Waypoin
     if (!logFile_) {
         RCLCPP_WARN(node_.get_logger(), "Could not open control log %s", logPath.c_str());
     } else {
+        // reverse=1 and cmd_vx<0 means a real rollback; a jump in closest_i
+        // with reverse=0 is the old nearest-XY snap onto the overlapping tail.
         logFile_ << "t,x,y,yaw,act_vx,act_wz,closest_i,cte,target_x,target_y,dist_target,dist_goal,"
-                    "desired_yaw,heading_err,heading_err_deg,cmd_vx,cmd_wz,wz_sat,at_goal\n";
+                    "desired_yaw,heading_err,heading_err_deg,cmd_vx,cmd_wz,wz_sat,at_goal,reverse\n";
         RCLCPP_INFO(node_.get_logger(), "Control log: %s", logPath.c_str());
     }
 }
@@ -111,6 +114,8 @@ bool ArduroverController::SetupArdurover() {
     return false;
 }
 
+// Pure-pursuit on a smooth stretch. Progress and 180s are not carrot problems:
+// we step one segment at a time, and a cusp is a vertex plus a discrete maneuver.
 constexpr double kLookaheadM = 1.4;     // default carrot; 2 m cut corners on path 1/2
 constexpr double kLookaheadMinM = 0.6;  // floor in a sharp turn
 constexpr double kTurnHeadingRad = 0.7; // |ψe| at which look-ahead/speed are fully tightened
@@ -118,79 +123,208 @@ constexpr double kMinTurnSpeed = 0.35;  // fraction of cruise when |ψe| is larg
 constexpr double kCruiseSpeed = 0.8;
 constexpr double kHeadingP = 1.0;     // flip sign if BODY_NED steers the wrong way
 constexpr double kMaxYawRate = 0.6;   // stop spin-outs when heading error is large
-constexpr double kFinishRemainM = 0.1;  // leftover polyline; 1 m fires on path 0/1 reverse tails
-constexpr double kReverseHeadingRad = 2.0;  // carrot behind (~115 deg) → reverse, don't yaw 180
-constexpr double kMaxIndexAdvanceM = 3.0;  // don't skip to an overlapping later stretch
-constexpr double kSlowdownM = 4.0;    // bleed speed into the finish
-constexpr double kRadToDeg = 180.0 / 3.14159265358979323846;
+constexpr double kSlowdownM = 4.0;    // bleed speed into the true polyline end (not a stop rule)
+constexpr double kCuspDot = -0.5;     // next tangent opposite current → fold / 180 vertex
+constexpr double kSegPastEps = 1e-3;  // increment index only once projection is past the end
+constexpr double kTinySegM = 1e-4;    // skip degenerate samples when taking a tangent
+constexpr double kYawSameRad = 0.7;   // path yaw after the fold matches vehicle heading
+constexpr double kYawFlipRad = 2.0;   // ~115 deg: recorded yaw flipped (real U-turn)
+constexpr double kTurnAlignRad = 0.25;  // leave Turn once heading matches the outgoing yaw
+constexpr double kTurnCreep = 0.15;     // slow vx while spinning at a heading-180
+constexpr double kCuspApproachM = 1.5;  // bleed speed so we arrive at the vertex before reversing
+constexpr double kReverseEndSlowM = 0.4;
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kRadToDeg = 180.0 / kPi;
 
 double distance(const Waypoint &a, const Waypoint &b) {
     return std::hypot(a.x - b.x, a.y - b.y);
 }
 
-// Nearest sample at or after `from`, but only within the next few metres of
-// polyline. Searching the whole suffix snaps forward onto a reverse tail that
-// occupies the same XY as the outbound (path 0 / 180-rollback).
-std::size_t closest_index_from(const Waypoint &pose, const std::vector<Waypoint> &path, std::size_t from) {
-    std::size_t best = from;
-    double best_distance = distance(pose, path[from]);
-    double traveled = 0.0;
-    for (std::size_t i = from + 1; i < path.size(); ++i) {
-        traveled += distance(path[i - 1], path[i]);
-        if (traveled > kMaxIndexAdvanceM) {
-            break;
-        }
-        const double candidate_distance = distance(pose, path[i]);
-        if (candidate_distance < best_distance) {
-            best_distance = candidate_distance;
-            best = i;
-        }
+double segment_length(const std::vector<Waypoint> &path, std::size_t i) {
+    if (i + 1 >= path.size()) {
+        return 0.0;
     }
-    return best;
+    return distance(path[i], path[i + 1]);
 }
 
-// Aim this far along the polyline, not at the finish and not at the closest
-// sample (closest is beside you → heading error ~0 while you drift).
-// Stop at a cusp (segment reverse) so a 1.4 m carrot does not sit on path 0's
-// ~1 m rollback while still outbound — that starts REV early and looks like a stop.
-Waypoint lookahead_waypoint(const std::vector<Waypoint> &path, std::size_t from, double lookahead_m) {
-    double traveled = 0.0;
-    std::size_t i = from;
-    double prev_dx = 0.0;
-    double prev_dy = 0.0;
-    bool have_prev = false;
-    while (i + 1 < path.size() && traveled < lookahead_m) {
-        const double dx = path[i + 1].x - path[i].x;
-        const double dy = path[i + 1].y - path[i].y;
-        if (have_prev && (prev_dx * dx + prev_dy * dy) < 0.0) {
-            break;
-        }
-        traveled += std::hypot(dx, dy);
-        prev_dx = dx;
-        prev_dy = dy;
-        have_prev = true;
-        ++i;
+// Unclamped projection of pose onto segment [a, b]. t in [0, 1] is on the
+// segment; t > 1 means we have passed the end and may step the index.
+// Degenerate (zero-length) samples count as already past so we skip them.
+double project_t(const Waypoint &pose, const Waypoint &a, const Waypoint &b) {
+    const double abx = b.x - a.x;
+    const double aby = b.y - a.y;
+    const double len2 = abx * abx + aby * aby;
+    if (len2 < 1e-16) {
+        return 1.0;
     }
-    return path[i];
+    return ((pose.x - a.x) * abx + (pose.y - a.y) * aby) / len2;
 }
 
-// Leftover polyline after closest_i. Crow-flies to path.back() lies when the
-// recording rolls back at the finish (path 0).
-double remaining_path_length(const std::vector<Waypoint> &path, std::size_t from) {
-    double length = 0.0;
-    for (std::size_t i = from; i + 1 < path.size(); ++i) {
-        length += distance(path[i], path[i + 1]);
+struct Tangent {
+    double dx{0.0};
+    double dy{0.0};
+    double len{0.0};
+};
+
+// First non-tiny chord into / out of a vertex. Recordings leave 1e-4 m jitter
+// samples that would otherwise give a nonsense heading.
+std::optional<Tangent> incoming_tangent(const std::vector<Waypoint> &path, std::size_t vertex) {
+    if (vertex == 0) {
+        return std::nullopt;
+    }
+    for (std::size_t i = vertex; i-- > 0;) {
+        const double dx = path[vertex].x - path[i].x;
+        const double dy = path[vertex].y - path[i].y;
+        const double len = std::hypot(dx, dy);
+        if (len > kTinySegM) {
+            return Tangent{dx, dy, len};
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<Tangent> outgoing_tangent(const std::vector<Waypoint> &path, std::size_t vertex) {
+    for (std::size_t i = vertex + 1; i < path.size(); ++i) {
+        const double dx = path[i].x - path[vertex].x;
+        const double dy = path[i].y - path[vertex].y;
+        const double len = std::hypot(dx, dy);
+        if (len > kTinySegM) {
+            return Tangent{dx, dy, len};
+        }
+    }
+    return std::nullopt;
+}
+
+double tangent_dot(const Tangent &a, const Tangent &b) {
+    return (a.dx * b.dx + a.dy * b.dy) / (a.len * b.len);
+}
+
+// Fold in the polyline: incoming and outgoing travel point opposite ways.
+// This is a vertex problem, not a "carrot is behind us" problem.
+bool is_cusp_at_vertex(const std::vector<Waypoint> &path, std::size_t vertex) {
+    const auto in = incoming_tangent(path, vertex);
+    const auto out = outgoing_tangent(path, vertex);
+    return in && out && tangent_dot(*in, *out) < kCuspDot;
+}
+
+// First cusp at or after the end of from_seg. Used both to stop the carrot
+// and to decide when we have physically arrived at the fold.
+std::optional<std::size_t> next_cusp_vertex(const std::vector<Waypoint> &path, std::size_t from_seg) {
+    const std::size_t start = from_seg + 1;
+    for (std::size_t v = start; v + 1 < path.size(); ++v) {
+        if (is_cusp_at_vertex(path, v)) {
+            return v;
+        }
+    }
+    return std::nullopt;
+}
+
+enum class CuspKind { Reverse, Turn, Pass };
+
+// How to leave a cusp. Do not use |heading_error| to a carrot — after an
+// index jump that carrot can already sit on the overlapping reverse tail.
+//
+// Reverse: path yaw is unchanged and XY after the fold goes the other way
+//   (path 0/1 rollback; heading already matches body-back travel).
+// Turn: recorded yaw flips ~180° — a real U-turn, spin then go forward.
+// Pass: same yaw, travel still ahead — recording wiggle, just step through.
+CuspKind classify_cusp(const std::vector<Waypoint> &path, std::size_t vertex, double vehicle_yaw) {
+    const auto out = outgoing_tangent(path, vertex);
+    if (!out) {
+        return CuspKind::Pass;
+    }
+    const double travel = std::atan2(out->dy, out->dx);
+    const std::size_t yaw_i = std::min(vertex + 1, path.size() - 1);
+    const double path_yaw_after = path[yaw_i].yaw;
+    const double yaw_err = std::abs(wrap(path_yaw_after - vehicle_yaw));
+    const double travel_vs_yaw = std::abs(wrap(travel - vehicle_yaw));
+    if (yaw_err < kYawSameRad && travel_vs_yaw > kYawFlipRad) {
+        return CuspKind::Reverse;
+    }
+    if (yaw_err > kYawFlipRad) {
+        return CuspKind::Turn;
+    }
+    return CuspKind::Pass;
+}
+
+// Recorded heading on the outgoing side of the fold — the yaw we spin toward.
+double path_yaw_after_vertex(const std::vector<Waypoint> &path, std::size_t vertex) {
+    return path[std::min(vertex + 1, path.size() - 1)].yaw;
+}
+
+// Arrived = we have stepped onto the vertex, or the projection on the
+// inbound segment is past it and we are actually nearby (not a distant
+// collinear projection onto an overlapping later stretch).
+bool arrived_at_vertex(
+    const Waypoint &pose, const std::vector<Waypoint> &path, std::size_t progress, std::size_t vertex
+) {
+    if (progress >= vertex) {
+        return true;
+    }
+    if (vertex == 0) {
+        return true;
+    }
+    if (distance(pose, path[vertex]) > 2.0) {
+        return false;
+    }
+    return project_t(pose, path[vertex - 1], path[vertex]) >= 1.0 - kSegPastEps;
+}
+
+Waypoint interpolate(const Waypoint &a, const Waypoint &b, double t) {
+    t = std::clamp(t, 0.0, 1.0);
+    return {a.x + t * (b.x - a.x), a.y + t * (b.y - a.y), wrap(a.yaw + t * wrap(b.yaw - a.yaw))};
+}
+
+// Carrot at along-track s + L on this unfolding of the polyline (interpolated,
+// not the nearest sample). Stop at a cusp so a 1.4 m look-ahead does not sit
+// on path 0's ~1 m rollback while we are still outbound.
+Waypoint lookahead_waypoint(const std::vector<Waypoint> &path, std::size_t from, double t_on_seg, double lookahead_m) {
+    if (path.size() < 2) {
+        return path.front();
+    }
+    if (from + 1 >= path.size()) {
+        return path.back();
+    }
+    const double t0 = std::clamp(t_on_seg, 0.0, 1.0);
+    const double seg_len = segment_length(path, from);
+    const double remain_on_seg = (1.0 - t0) * seg_len;
+    if (lookahead_m <= remain_on_seg) {
+        const double u = (seg_len < 1e-12) ? 1.0 : t0 + lookahead_m / seg_len;
+        return interpolate(path[from], path[from + 1], u);
+    }
+    lookahead_m -= remain_on_seg;
+    for (std::size_t i = from + 1; i + 1 < path.size(); ++i) {
+        if (is_cusp_at_vertex(path, i)) {
+            return path[i];
+        }
+        const double len = segment_length(path, i);
+        if (lookahead_m <= len) {
+            return interpolate(path[i], path[i + 1], (len < 1e-12) ? 1.0 : lookahead_m / len);
+        }
+        lookahead_m -= len;
+    }
+    return path.back();
+}
+
+// Leftover polyline from the current projection. Used only to bleed speed;
+// never as a stop condition (path 0's reverse tail is itself ~1 m).
+double remaining_path_length(const std::vector<Waypoint> &path, std::size_t from, double t_on_seg) {
+    if (from + 1 >= path.size()) {
+        return 0.0;
+    }
+    double length = (1.0 - std::clamp(t_on_seg, 0.0, 1.0)) * segment_length(path, from);
+    for (std::size_t i = from + 1; i + 1 < path.size(); ++i) {
+        length += segment_length(path, i);
     }
     return length;
 }
 
-// Signed distance to the path (m). Heading-only can stay parallel and offset;
-// this is that sideways error (log / later CTE term). Positive = left of segment.
-double signed_cross_track(const Waypoint &pose, const std::vector<Waypoint> &path, std::size_t closest_i) {
+// Signed distance to the current segment. Positive = left of travel direction.
+double signed_cross_track(const Waypoint &pose, const std::vector<Waypoint> &path, std::size_t seg_i) {
     if (path.size() < 2) {
         return 0.0;
     }
-    const std::size_t i0 = (closest_i + 1 < path.size()) ? closest_i : closest_i - 1;
+    const std::size_t i0 = (seg_i + 1 < path.size()) ? seg_i : path.size() - 2;
     const Waypoint &a = path[i0];
     const Waypoint &b = path[i0 + 1];
     const double abx = b.x - a.x;
@@ -202,6 +336,20 @@ double signed_cross_track(const Waypoint &pose, const std::vector<Waypoint> &pat
     return (abx * (pose.y - a.y) - aby * (pose.x - a.x)) / len;
 }
 
+// True end of this unfolding: last index, or last segment with t past 1.
+// Crow-flies to path.back() is the same collinear trap as the old 136→156 jump.
+bool at_polyline_end(const std::vector<Waypoint> &path, std::size_t progress, double t_on_seg) {
+    if (path.size() < 2) {
+        return true;
+    }
+    if (progress + 1 >= path.size()) {
+        return true;
+    }
+    return progress + 1 == path.size() - 1 && t_on_seg >= 1.0 - kSegPastEps;
+}
+
+// One tick: step the current segment, start a cusp maneuver if we just
+// arrived at a fold, then steer with the carrot (or the Turn yaw target).
 void ArduroverController::Control(const nav_msgs::msg::Odometry &odometry) {
     Waypoint current_waypoint{
         odometry.pose.pose.position.x,
@@ -209,54 +357,126 @@ void ArduroverController::Control(const nav_msgs::msg::Odometry &odometry) {
         yaw_from_quat(odometry.pose.pose.orientation)
     };
 
-    progressIndex_ = closest_index_from(current_waypoint, path_, progressIndex_);
+    // Step along the current segment only. Never snap to a closer sample on an
+    // overlapping reverse tail (that was the 136 → 156 jump on path 0).
+    if (path_.size() >= 2) {
+        const std::size_t last_pt = path_.size() - 1;
+        const std::size_t last_seg = path_.size() - 2;
+        while (progressIndex_ < last_seg) {
+            const double t = project_t(current_waypoint, path_[progressIndex_], path_[progressIndex_ + 1]);
+            if (t > 1.0 - kSegPastEps) {
+                ++progressIndex_;
+            } else {
+                break;
+            }
+        }
+        if (progressIndex_ == last_seg &&
+            project_t(current_waypoint, path_[last_seg], path_[last_pt]) > 1.0 - kSegPastEps) {
+            progressIndex_ = last_pt;
+        }
+    }
+
     const std::size_t closest_i = progressIndex_;
 
-    // First carrot at the default look-ahead, then shorten if we are already
-    // aimed across a bend (long carrot + speed = cut the vertex).
+    // Drive to the cusp vertex with forward vx (carrot already stopped there).
+    // Only then pick reverse vs spin from the path geometry, and pin the index
+    // on the outgoing side so look-ahead walks the reverse tail instead of
+    // sitting on the vertex.
+    if (driveMode_ == DriveMode::Forward) {
+        if (const auto vertex = next_cusp_vertex(path_, closest_i > 0 ? closest_i - 1 : 0)) {
+            if (arrived_at_vertex(current_waypoint, path_, closest_i, *vertex)) {
+                const CuspKind kind = classify_cusp(path_, *vertex, current_waypoint.yaw);
+                if (kind == CuspKind::Reverse) {
+                    driveMode_ = DriveMode::Reverse;
+                    progressIndex_ = std::max(progressIndex_, *vertex);
+                    RCLCPP_INFO(node_.get_logger(), "Cusp i=%zu: reverse (same yaw, travel behind)", *vertex);
+                } else if (kind == CuspKind::Turn) {
+                    driveMode_ = DriveMode::Turn;
+                    turnTargetYaw_ = path_yaw_after_vertex(path_, *vertex);
+                    progressIndex_ = std::max(progressIndex_, *vertex);
+                    RCLCPP_INFO(node_.get_logger(), "Cusp i=%zu: turn to yaw %.2f", *vertex, turnTargetYaw_);
+                }
+            }
+        }
+    } else if (driveMode_ == DriveMode::Turn) {
+        if (std::abs(wrap(turnTargetYaw_ - current_waypoint.yaw)) < kTurnAlignRad) {
+            driveMode_ = DriveMode::Forward;
+        }
+    }
+
+    const std::size_t track_i = progressIndex_;
+    const double track_t =
+        (track_i + 1 < path_.size()) ? project_t(current_waypoint, path_[track_i], path_[track_i + 1]) : 1.0;
+
+    const bool reversing = driveMode_ == DriveMode::Reverse;
+    const bool turning = driveMode_ == DriveMode::Turn;
+
+    // BODY_NED heading to the carrot. Reverse uses the same carrot on the
+    // outgoing stretch, then subtracts π so we steer while backing instead of
+    // yawing 180. Turn aims at the recorded outgoing yaw, not the carrot.
     auto heading_toward = [&](const Waypoint &to) {
         return wrap(std::atan2(to.y - current_waypoint.y, to.x - current_waypoint.x) - current_waypoint.yaw);
     };
-    Waypoint target = lookahead_waypoint(path_, closest_i, kLookaheadM);
-    double heading_error = heading_toward(target);
-    // Path 0/1 recordings reverse along the same heading. |ψe|~π would otherwise spin.
-    const bool reverse = std::abs(heading_error) > kReverseHeadingRad;
+
+    double lookahead_m = kLookaheadM;
     double turn = 0.0;
-    if (reverse) {
-        heading_error = wrap(heading_error - std::copysign(3.14159265358979323846, heading_error));
+    Waypoint target = lookahead_waypoint(path_, track_i, track_t, lookahead_m);
+    double heading_error = heading_toward(target);
+    if (reversing) {
+        heading_error = wrap(heading_error - std::copysign(kPi, heading_error));
+    } else if (turning) {
+        heading_error = wrap(turnTargetYaw_ - current_waypoint.yaw);
+        target = lookahead_waypoint(path_, track_i, track_t, kLookaheadMinM);
     } else {
+        // Shorten the carrot in a bend so we do not cut path 1/2 vertices.
+        // Do not shrink it globally hoping a 180 falls out of the look-ahead.
         turn = std::clamp(std::abs(heading_error) / kTurnHeadingRad, 0.0, 1.0);
-        const double lookahead_m = kLookaheadM + (kLookaheadMinM - kLookaheadM) * turn;
+        lookahead_m = kLookaheadM + (kLookaheadMinM - kLookaheadM) * turn;
         if (turn > 0.0) {
-            target = lookahead_waypoint(path_, closest_i, lookahead_m);
+            target = lookahead_waypoint(path_, track_i, track_t, lookahead_m);
             heading_error = heading_toward(target);
         }
     }
-    const double desired_heading = std::atan2(target.y - current_waypoint.y, target.x - current_waypoint.x);
+
+    const double desired_heading = turning ? turnTargetYaw_
+                                           : std::atan2(target.y - current_waypoint.y, target.x - current_waypoint.x);
     const double heading_error_deg = heading_error * kRadToDeg;
     const double dist_target = distance(current_waypoint, target);
     const double dist_goal = distance(current_waypoint, path_.back());
-    const double remaining = remaining_path_length(path_, closest_i);
-    const double approach = remaining;
-    const double cte = signed_cross_track(current_waypoint, path_, closest_i);
+    const double remaining = remaining_path_length(path_, track_i, track_t);
+    const double cte = signed_cross_track(current_waypoint, path_, track_i);
 
-    // Body command only. Firmware mixes wheels. Zero Twist = request stop.
     geometry_msgs::msg::TwistStamped cmd;
     cmd.header.stamp = node_.now();
     cmd.header.frame_id = "base_link";
 
-    // Do not use dist_goal or a 1 m remaining bubble: path.back() lies on the
-    // outbound, and the reverse tail is itself ~1 m, so both latch before the apex.
-    if (!finished_ && (closest_i + 1 >= path_.size() || remaining <= kFinishRemainM)) {
+    // Finish is the last vertex of this unfolding, not crow-flies to path.back()
+    // and not leftover length (path 0's reverse tail is itself ~1 m).
+    if (!finished_ && at_polyline_end(path_, progressIndex_, track_t)) {
         finished_ = true;
     }
     const bool at_goal = finished_;
     if (!at_goal) {
-        const double end_scale =
-            reverse ? 1.0 : std::clamp(approach / kSlowdownM, 0.0, 1.0);
-        const double turn_scale = 1.0 - (1.0 - kMinTurnSpeed) * turn;
-        const double vx_sign = reverse ? -1.0 : 1.0;
-        cmd.twist.linear.x = vx_sign * kCruiseSpeed * end_scale * turn_scale;
+        // Reverse keeps cruise so a 1 m rollback is visible; only creep at a
+        // U-turn. Forward still bleeds into the real end and into a cusp so
+        // we do not punch through the vertex still commanding +vx.
+        double end_scale = 1.0;
+        if (reversing) {
+            end_scale = remaining < kReverseEndSlowM ? std::clamp(remaining / kReverseEndSlowM, 0.35, 1.0) : 1.0;
+        } else if (!turning) {
+            end_scale = std::clamp(remaining / kSlowdownM, 0.0, 1.0);
+            if (const auto vertex = next_cusp_vertex(path_, track_i > 0 ? track_i - 1 : 0)) {
+                if (!arrived_at_vertex(current_waypoint, path_, track_i, *vertex)) {
+                    const double to_cusp = distance(current_waypoint, path_[*vertex]);
+                    if (to_cusp < kCuspApproachM) {
+                        end_scale = std::min(end_scale, std::clamp(to_cusp / kCuspApproachM, 0.3, 1.0));
+                    }
+                }
+            }
+        }
+        const double turn_scale = turning ? 1.0 : 1.0 - (1.0 - kMinTurnSpeed) * turn;
+        const double speed = turning ? kTurnCreep : kCruiseSpeed * end_scale * turn_scale;
+        cmd.twist.linear.x = (reversing ? -1.0 : 1.0) * speed;
         cmd.twist.angular.z = std::clamp(kHeadingP * heading_error, -kMaxYawRate, kMaxYawRate);
     }
     const bool wz_sat = !at_goal && std::abs(kHeadingP * heading_error) > kMaxYawRate + 1e-9;
@@ -266,17 +486,17 @@ void ArduroverController::Control(const nav_msgs::msg::Odometry &odometry) {
     if (logFile_.is_open()) {
         logFile_ << std::fixed << std::setprecision(4) << node_.now().seconds() << ',' << current_waypoint.x << ','
                  << current_waypoint.y << ',' << current_waypoint.yaw << ',' << odometry.twist.twist.linear.x << ','
-                 << odometry.twist.twist.angular.z << ',' << closest_i << ',' << cte << ',' << target.x << ',' << target.y
-                 << ',' << dist_target << ',' << dist_goal << ',' << desired_heading << ',' << heading_error << ','
-                 << heading_error_deg << ',' << cmd.twist.linear.x << ',' << cmd.twist.angular.z << ',' << wz_sat << ','
-                 << at_goal << '\n';
+                 << odometry.twist.twist.angular.z << ',' << progressIndex_ << ',' << cte << ',' << target.x << ','
+                 << target.y << ',' << dist_target << ',' << dist_goal << ',' << desired_heading << ',' << heading_error
+                 << ',' << heading_error_deg << ',' << cmd.twist.linear.x << ',' << cmd.twist.angular.z << ',' << wz_sat
+                 << ',' << at_goal << ',' << (reversing ? 1 : 0) << '\n';
         logFile_.flush();
     }
 
     if (at_goal) {
         if (!loggedGoal_) {
             RCLCPP_INFO(
-                node_.get_logger(), "At goal (i=%zu dist=%.2f m remaining=%.2f m), stopping", closest_i, dist_goal,
+                node_.get_logger(), "At goal (i=%zu dist=%.2f m remaining=%.2f m), stopping", progressIndex_, dist_goal,
                 remaining
             );
             loggedGoal_ = true;
@@ -284,10 +504,11 @@ void ArduroverController::Control(const nav_msgs::msg::Odometry &odometry) {
         return;
     }
 
+    const char *mode = reversing ? " REV" : turning ? " TURN" : "";
     RCLCPP_INFO_THROTTLE(
         node_.get_logger(), *node_.get_clock(), 500,
-        "i=%zu cte=%.3f m  he=%.1f deg  cmd vx=%.2f wz=%.2f%s%s  act vx=%.2f wz=%.2f  d_la=%.2f remain=%.2f", closest_i,
-        cte, heading_error_deg, cmd.twist.linear.x, cmd.twist.angular.z, reverse ? " REV" : "", wz_sat ? " SAT" : "",
+        "i=%zu cte=%.3f m  he=%.1f deg  cmd vx=%.2f wz=%.2f%s%s  act vx=%.2f wz=%.2f  d_la=%.2f remain=%.2f",
+        progressIndex_, cte, heading_error_deg, cmd.twist.linear.x, cmd.twist.angular.z, mode, wz_sat ? " SAT" : "",
         odometry.twist.twist.linear.x, odometry.twist.twist.angular.z, dist_target, remaining
     );
 }
