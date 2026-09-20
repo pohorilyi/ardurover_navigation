@@ -128,11 +128,14 @@ constexpr double kCuspDot = -0.5;     // next tangent opposite current → fold 
 constexpr double kSegPastEps = 1e-3;  // increment index only once projection is past the end
 constexpr double kTinySegM = 1e-4;    // skip degenerate samples when taking a tangent
 constexpr double kSkipSegM = 0.12;    // hairpin recordings (path 2 i=103) are 5 cm; projection never passes
-constexpr double kYawSameRad = 0.7;   // path yaw after the fold matches vehicle heading
+constexpr double kYawSameRad = 0.7;   // recorded yaw unchanged across the fold
 constexpr double kYawFlipRad = 2.0;   // ~115 deg: recorded yaw flipped (real U-turn)
 constexpr double kTurnAlignRad = 0.25;  // leave Turn once heading matches the outgoing yaw
 constexpr double kTurnCreep = 0.15;     // slow vx while spinning at a heading-180
 constexpr double kCuspApproachM = 1.5;  // bleed speed so we arrive at the fold before stopping / turning
+constexpr double kRollbackTailM = 2.0;  // leftover after a fold: stop-rollback, not a mid-path wiggle
+constexpr double kCatchUpM = 10.0;      // cut-corner: search this far ahead for a closer segment
+constexpr double kCatchUpBetterM = 0.15;  // later segment must beat the current one by this
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kRadToDeg = 180.0 / kPi;
 // Boardwalk hang: reverse to unhook, then a forward+yaw push while the bumper
@@ -244,14 +247,14 @@ std::optional<std::size_t> next_cusp_vertex(const std::vector<Waypoint> &path, s
 
 enum class CuspKind { End, Turn, Pass };
 
-// How to leave a cusp. Do not use |heading_error| to a carrot — after an
-// index jump that carrot can already sit on the overlapping reverse tail.
+// Classify from the recording, not the vehicle heading. Using vehicle yaw
+// turned path 2 i=69 (a 9 cm wiggle) into a Turn after the rover spun.
 //
-// End: path yaw is unchanged and XY after the fold goes the other way
+// End: recorded yaw unchanged and XY after the fold goes the other way
 //   (path 0/1 ~1 m stop-rollback). Do not track it backwards.
 // Turn: recorded yaw flips ~180° — a real U-turn, spin then go forward.
-// Pass: same yaw, travel still ahead — recording wiggle, just step through.
-CuspKind classify_cusp(const std::vector<Waypoint> &path, std::size_t vertex, double vehicle_yaw) {
+// Pass: recording wiggle, just step through.
+CuspKind classify_cusp(const std::vector<Waypoint> &path, std::size_t vertex) {
     const auto out = outgoing_tangent(path, vertex);
     if (!out) {
         return CuspKind::Pass;
@@ -259,15 +262,72 @@ CuspKind classify_cusp(const std::vector<Waypoint> &path, std::size_t vertex, do
     const double travel = std::atan2(out->dy, out->dx);
     const std::size_t yaw_i = std::min(vertex + 1, path.size() - 1);
     const double path_yaw_after = path[yaw_i].yaw;
-    const double yaw_err = std::abs(wrap(path_yaw_after - vehicle_yaw));
-    const double travel_vs_yaw = std::abs(wrap(travel - vehicle_yaw));
-    if (yaw_err < kYawSameRad && travel_vs_yaw > kYawFlipRad) {
+    const double path_yaw_at = path[vertex].yaw;
+    const double yaw_delta = std::abs(wrap(path_yaw_after - path_yaw_at));
+    const double travel_vs_yaw = std::abs(wrap(travel - path_yaw_after));
+    if (yaw_delta < kYawSameRad && travel_vs_yaw > kYawFlipRad) {
         return CuspKind::End;
     }
-    if (yaw_err > kYawFlipRad) {
+    if (yaw_delta > kYawFlipRad) {
         return CuspKind::Turn;
     }
     return CuspKind::Pass;
+}
+
+// End / Turn must stop the carrot and bleed speed. A Pass fold is a recorded
+// wiggle (path 2 i=69 / i=177) — look and drive through it.
+bool is_hard_cusp(const std::vector<Waypoint> &path, std::size_t vertex) {
+    return is_cusp_at_vertex(path, vertex) && classify_cusp(path, vertex) != CuspKind::Pass;
+}
+
+std::optional<std::size_t> next_hard_cusp_vertex(const std::vector<Waypoint> &path, std::size_t from_seg) {
+    const std::size_t start = from_seg + 1;
+    for (std::size_t v = start; v + 1 < path.size(); ++v) {
+        if (is_hard_cusp(path, v)) {
+            return v;
+        }
+    }
+    return std::nullopt;
+}
+
+// After cutting a Pass fold, projection t on the inbound segment never
+// exceeds 1 (path 2 i=166). Step forward to a later, closer segment.
+// Search only ahead, and never across an End/Turn (path 0 rollback).
+std::size_t catch_up_progress(
+    const Waypoint &pose, const std::vector<Waypoint> &path, std::size_t progress
+) {
+    if (progress + 1 >= path.size()) {
+        return progress;
+    }
+    auto seg_dist = [&](std::size_t i) {
+        if (i + 1 >= path.size()) {
+            return distance(pose, path.back());
+        }
+        const double t = std::clamp(project_t(pose, path[i], path[i + 1]), 0.0, 1.0);
+        const double x = path[i].x + t * (path[i + 1].x - path[i].x);
+        const double y = path[i].y + t * (path[i + 1].y - path[i].y);
+        return std::hypot(pose.x - x, pose.y - y);
+    };
+
+    std::size_t best = progress;
+    double best_d = seg_dist(progress);
+    double traveled = 0.0;
+    const std::size_t last_seg = path.size() - 2;
+    for (std::size_t i = progress; i < last_seg; ++i) {
+        if (is_hard_cusp(path, i + 1)) {
+            break;
+        }
+        traveled += segment_length(path, i);
+        if (traveled > kCatchUpM) {
+            break;
+        }
+        const double d = seg_dist(i + 1);
+        if (d + kCatchUpBetterM < best_d) {
+            best = i + 1;
+            best_d = d;
+        }
+    }
+    return best;
 }
 
 // Recorded heading on the outgoing side of the fold — the yaw we spin toward.
@@ -299,8 +359,8 @@ Waypoint interpolate(const Waypoint &a, const Waypoint &b, double t) {
 }
 
 // Carrot at along-track s + L on this unfolding of the polyline (interpolated,
-// not the nearest sample). Stop at a cusp so a 1.4 m look-ahead does not sit
-// on path 0's ~1 m rollback while we are still outbound.
+// not the nearest sample). Stop at End/Turn so a 1.4 m look-ahead does not sit
+// on path 0's ~1 m rollback. Pass folds are not a wall.
 Waypoint lookahead_waypoint(const std::vector<Waypoint> &path, std::size_t from, double t_on_seg, double lookahead_m) {
     if (path.size() < 2) {
         return path.front();
@@ -317,7 +377,7 @@ Waypoint lookahead_waypoint(const std::vector<Waypoint> &path, std::size_t from,
     }
     lookahead_m -= remain_on_seg;
     for (std::size_t i = from + 1; i + 1 < path.size(); ++i) {
-        if (is_cusp_at_vertex(path, i)) {
+        if (is_hard_cusp(path, i)) {
             return path[i];
         }
         const double len = segment_length(path, i);
@@ -340,6 +400,12 @@ double remaining_path_length(const std::vector<Waypoint> &path, std::size_t from
         length += segment_length(path, i);
     }
     return length;
+}
+
+// Path 0/1 end with a ~1 m recorded rollback. Path 2 i=69 leaves ~62 m —
+// that is a wiggle, not a finish.
+bool is_rollback_tail(const std::vector<Waypoint> &path, std::size_t vertex) {
+    return remaining_path_length(path, vertex, 0.0) <= kRollbackTailM;
 }
 
 // Signed distance to the current segment. Positive = left of travel direction.
@@ -568,10 +634,10 @@ void ArduroverController::Control(const nav_msgs::msg::Odometry &odometry) {
         while (progressIndex_ < last_seg) {
             // Dense hairpin samples (5–8 cm) leave t∈(0,1) forever when we are
             // 1 m beside the apex — that was the i=103 orbit. Skip them; do not
-            // jump to a distant overlapping tail (only tiny chords), and do not
-            // skip a fold onto the recorded rollback.
+            // jump a distant overlapping tail. Only freeze on a short rollback
+            // tail (path 0/1); mid-path wiggles (path 2 i=69) stay skippable.
             if (segment_length(path_, progressIndex_) < kSkipSegM) {
-                if (is_cusp_at_vertex(path_, progressIndex_)) {
+                if (is_cusp_at_vertex(path_, progressIndex_) && is_rollback_tail(path_, progressIndex_)) {
                     break;
                 }
                 ++progressIndex_;
@@ -588,6 +654,7 @@ void ArduroverController::Control(const nav_msgs::msg::Odometry &odometry) {
             project_t(current_waypoint, path_[last_seg], path_[last_pt]) > 1.0 - kSegPastEps) {
             progressIndex_ = last_pt;
         }
+        progressIndex_ = catch_up_progress(current_waypoint, path_, progressIndex_);
     }
 
     const std::size_t closest_i = progressIndex_;
@@ -597,10 +664,12 @@ void ArduroverController::Control(const nav_msgs::msg::Odometry &odometry) {
     if (driveMode_ == DriveMode::Forward) {
         if (const auto vertex = next_cusp_vertex(path_, closest_i > 0 ? closest_i - 1 : 0)) {
             if (arrived_at_vertex(current_waypoint, path_, closest_i, *vertex)) {
-                const CuspKind kind = classify_cusp(path_, *vertex, current_waypoint.yaw);
-                if (kind == CuspKind::End) {
-                    finished_ = true;
-                    RCLCPP_INFO(node_.get_logger(), "Cusp i=%zu: recorded rollback, stopping", *vertex);
+                const CuspKind kind = classify_cusp(path_, *vertex);
+                if (kind == CuspKind::End && is_rollback_tail(path_, *vertex)) {
+                    if (!finished_) {
+                        finished_ = true;
+                        RCLCPP_INFO(node_.get_logger(), "Cusp i=%zu: recorded rollback, stopping", *vertex);
+                    }
                 } else if (kind == CuspKind::Turn) {
                     driveMode_ = DriveMode::Turn;
                     turnTargetYaw_ = path_yaw_after_vertex(path_, *vertex);
@@ -694,7 +763,7 @@ void ArduroverController::Control(const nav_msgs::msg::Odometry &odometry) {
         double end_scale = 1.0;
         if (!turning) {
             end_scale = std::clamp(remaining / kSlowdownM, 0.0, 1.0);
-            if (const auto vertex = next_cusp_vertex(path_, track_i > 0 ? track_i - 1 : 0)) {
+            if (const auto vertex = next_hard_cusp_vertex(path_, track_i > 0 ? track_i - 1 : 0)) {
                 if (!arrived_at_vertex(current_waypoint, path_, track_i, *vertex)) {
                     const double to_cusp = distance(current_waypoint, path_[*vertex]);
                     if (to_cusp < kCuspApproachM) {
