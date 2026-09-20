@@ -6,5 +6,5 @@ log/
 __pycache__/
 paths/recorded.path
 *.csv
-paths/score*.txt
+*.txt
 .vscode/c_cpp_properties.json
