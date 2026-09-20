@@ -22,10 +22,10 @@ class ArduroverController {
 
   private:
     enum class SetupState { WaitServices, SetFrame, Prime, SetMode, Arm, Ready };
-    // Forward = carrot / pure-pursuit. Reverse and Turn are discrete cusp maneuvers,
-    // not something we infer from a carrot that may already sit on an overlapping tail.
+    // Forward = carrot / pure-pursuit. Turn is a yaw-flip cusp (spin, then go).
+    // A same-yaw rollback tail is the end of the forward run, not a drive mode.
     // Unstick is physics recovery (boardwalk lip): reverse to unhook, then drive.
-    enum class DriveMode { Forward, Reverse, Turn, Unstick };
+    enum class DriveMode { Forward, Turn, Unstick };
     enum class UnstickPhase { Reverse, Drive };
 
     void OnState(const mavros_msgs::msg::State& msg);
@@ -75,6 +75,7 @@ class ArduroverController {
     double unstickStartX_{0.0};
     double unstickStartY_{0.0};
     double unstickLastTilt_{0.0};
+    double unstickWiggleSign_{1.0};
 };
 
 }  // namespace ardurover_nav
