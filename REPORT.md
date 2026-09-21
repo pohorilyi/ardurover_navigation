@@ -64,7 +64,7 @@ If the carrot still lies behind the rover ($\vert\psi_e\vert > \pi/2$), $L$ is g
 
 ## Yaw command (PD)
 
-Yaw rate is PD on heading error, damped with **measured** yaw rate rather than $\dot{\psi}_e$. Differentiating the carrot bearing is noisy and pumps weave.
+Yaw rate is PD on heading error, damped with **measured** yaw rate rather than $\dot{\psi_e}$. Differentiating the carrot bearing is noisy and pumps weave.
 
 $$
 \omega_{\mathrm{pd}} = K_p \psi_e - K_d \omega_{\mathrm{meas}}, \qquad
@@ -89,12 +89,18 @@ The stop condition is the **end of the current unfolding** (last vertex, or last
 
 ## Cusps (recorded 180° folds)
 
-A vertex is a cusp when incoming and outgoing tangents satisfy $\hat{\mathbf{t}}_{\mathrm{in}}\cdot\hat{\mathbf{t}}_{\mathrm{out}} < -0.5$. Classification uses **recorded yaw**, not vehicle heading:
+A vertex is a cusp when incoming and outgoing tangents point nearly opposite ways:
+
+$$
+\hat{\mathbf{t}}_{\mathrm{in}} \cdot \hat{\mathbf{t}}_{\mathrm{out}} < -0.5
+$$
+
+Classification uses **recorded yaw**, not vehicle heading:
 
 | Kind | Recording | Action |
 |---|---|---|
 | **End** | Yaw unchanged, XY after the fold goes the other way (~1 m rollback on paths 0/1) | Stop. Do not track the reverse tail. |
-| **Turn** | Recorded yaw flips ~180° | Enter Turn: $\psi_e = \mathrm{wrap}(\psi_{\mathrm{out}} - \psi)$, creep $v_x$, leave when $\vert\psi_e\vert < 0.25$ rad. |
+| **Turn** | Recorded yaw flips ~180° | Spin toward the recorded outgoing yaw with creep $v_x$; leave when heading error is below 0.25 rad. |
 | **Pass** | Small recorded wiggle | Drive through; carrot and progress ignore it as a wall. |
 
 ## Unstick (boardwalk hang)
