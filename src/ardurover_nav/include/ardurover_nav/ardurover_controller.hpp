@@ -18,6 +18,7 @@ class ArduroverController {
     ArduroverController(rclcpp::Node& node, std::vector<Waypoint> path);
 
     bool SetupArdurover();
+    // 20 Hz tick: progress → cusp mode → carrot → vx/wz → unstick may overwrite → publish.
     void Control(const nav_msgs::msg::Odometry& odom);
 
   private:
@@ -49,6 +50,39 @@ class ArduroverController {
     void BeginUnstickPhase(UnstickPhase phase, const Waypoint& pose, double tilt);
     // Yaw command while driving off a lip: PD on heading, mixed toward the path if CTE is large.
     double SteerOffLip(double heading_error, double act_wz, double cte) const;
+    // Reverse wiggle until unhooked (or timeout), then switch to Drive.
+    void TickUnstickReverse(
+        const Waypoint& pose,
+        double act_wz,
+        double heading_error,
+        double cte,
+        double tilt,
+        double moved,
+        geometry_msgs::msg::TwistStamped& cmd
+    );
+    // Forward push off the lip; leave Unstick when clear, or reverse again if still hung.
+    void TickUnstickDrive(
+        const Waypoint& pose,
+        double act_vx,
+        double act_wz,
+        double heading_error,
+        double cte,
+        double tilt,
+        double moved,
+        bool tilt_falling,
+        bool heading_clear,
+        geometry_msgs::msg::TwistStamped& cmd
+    );
+    // Start Unstick if we have been commanding and frozen on XY.
+    void MaybeEnterUnstick(
+        const Waypoint& pose,
+        double act_vx,
+        double act_wz,
+        double heading_error,
+        double cte,
+        double tilt,
+        geometry_msgs::msg::TwistStamped& cmd
+    );
 
     rclcpp::Node& node_;
     std::vector<Waypoint> path_;
@@ -70,7 +104,6 @@ class ArduroverController {
     double turnTargetYaw_{0.0};     // recorded yaw after a heading-180 cusp (Turn mode)
     DriveMode preUnstickMode_{DriveMode::Forward};
     UnstickPhase unstickPhase_{UnstickPhase::Reverse};
-    int controlTicks_{0};
     int stuckTicks_{0};
     int unstickTicks_{0};
     int unstickCooldownTicks_{0};

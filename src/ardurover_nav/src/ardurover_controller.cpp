@@ -1,5 +1,6 @@
 #include "ardurover_nav/ardurover_controller.hpp"
 #include "ardurover_nav/path_follow.hpp"
+#include "ardurover_nav/unstick.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -153,7 +154,6 @@ void ArduroverController::RecoverStuck(
     bool at_goal,
     geometry_msgs::msg::TwistStamped &cmd
 ) {
-    ++controlTicks_;
     if (std::hypot(act_vx, act_wz) > kSeenMotionVel) {
         seenMotion_ = true;
     }
@@ -173,67 +173,110 @@ void ArduroverController::RecoverStuck(
         const bool tilt_falling = tilt > kTiltRad && tilt + 0.015 < unstickLastTilt_;
         unstickLastTilt_ = tilt;
         const bool heading_clear = std::abs(heading_error) < kUnstickClearHeadingRad;
-
         if (unstickPhase_ == UnstickPhase::Reverse) {
-            // One-sided wz (always toward the carrot) leaves a wheel on the lip.
-            // Alternate full yaw so left then right wheels take the reverse load.
-            if (unstickTicks_ > 1 && (unstickTicks_ - 1) % kUnstickWiggleTicks == 0) {
-                unstickWiggleSign_ = -unstickWiggleSign_;
-            }
-            cmd.twist.linear.x = -kUnstickReverseSpeed;
-            cmd.twist.angular.z = unstickWiggleSign_ * kMaxYawRate;
-            const bool wiggling = unstickTicks_ < kUnstickReverseTicks;
-            const bool unhooked = !wiggling && moved >= kUnstickReverseM;
-            if (unhooked || !wiggling) {
-                RCLCPP_INFO(
-                    node_.get_logger(),
-                    "Unstick: forward push (reversed %.2f m tilt=%.1f deg)",
-                    moved,
-                    tilt * kRadToDeg
-                );
-                BeginUnstickPhase(UnstickPhase::Drive, pose, tilt);
-                cmd.twist.linear.x = kUnstickDriveSpeed;
-                cmd.twist.angular.z = SteerOffLip(heading_error, act_wz, cte);
-            }
-            return;
-        }
-
-        cmd.twist.linear.x = kUnstickDriveSpeed;
-        cmd.twist.angular.z = SteerOffLip(heading_error, act_wz, cte);
-        // XY motion alone is not "free" — last run left at he=-28° and rammed
-        // the same lip. Resume only once the long carrot is roughly ahead.
-        if (unstickTicks_ >= kUnstickMinTicks && moved >= kUnstickDriveM && heading_clear) {
-            LeaveUnstick();
-            return;
-        }
-        if (unstickTicks_ >= kUnstickDriveTicks && !tilt_falling) {
-            if (heading_clear && moved >= 0.12) {
-                LeaveUnstick();
-                return;
-            }
-            // Already rolling (hairpin orbit, not a hang). Reverse-wiggle here
-            // is what threw path 2 i=103 into a 2 m circle.
-            if (std::hypot(act_vx, act_wz) > kSeenMotionVel) {
-                LeaveUnstick();
-                return;
-            }
-            if (unstickAttempt_ + 1 >= kUnstickMaxAttempts) {
-                RCLCPP_WARN(
-                    node_.get_logger(), "Unstick gave up after %d cycles (moved %.2f m)", unstickAttempt_ + 1, moved
-                );
-                LeaveUnstick();
-                return;
-            }
-            ++unstickAttempt_;
-            RCLCPP_INFO(node_.get_logger(), "Unstick: reverse wiggle again (fwd moved %.2f m he=%.1f deg)", moved,
-                        heading_error * kRadToDeg);
-            BeginUnstickPhase(UnstickPhase::Reverse, pose, tilt);
-            cmd.twist.linear.x = -kUnstickReverseSpeed;
-            cmd.twist.angular.z = unstickWiggleSign_ * kMaxYawRate;
+            TickUnstickReverse(pose, act_wz, heading_error, cte, tilt, moved, cmd);
+        } else {
+            TickUnstickDrive(
+                pose, act_vx, act_wz, heading_error, cte, tilt, moved, tilt_falling, heading_clear, cmd
+            );
         }
         return;
     }
 
+    MaybeEnterUnstick(pose, act_vx, act_wz, heading_error, cte, tilt, cmd);
+}
+
+// Reverse wiggle until unhooked (or timeout), then switch to Drive.
+void ArduroverController::TickUnstickReverse(
+    const Waypoint &pose,
+    double act_wz,
+    double heading_error,
+    double cte,
+    double tilt,
+    double moved,
+    geometry_msgs::msg::TwistStamped &cmd
+) {
+    // One-sided wz (always toward the carrot) leaves a wheel on the lip.
+    // Alternate full yaw so left then right wheels take the reverse load.
+    if (unstickTicks_ > 1 && (unstickTicks_ - 1) % kUnstickWiggleTicks == 0) {
+        unstickWiggleSign_ = -unstickWiggleSign_;
+    }
+    cmd.twist.linear.x = -kUnstickReverseSpeed;
+    cmd.twist.angular.z = unstickWiggleSign_ * kMaxYawRate;
+    const bool wiggling = unstickTicks_ < kUnstickReverseTicks;
+    const bool unhooked = !wiggling && moved >= kUnstickReverseM;
+    const bool reverse_timeout = unstickTicks_ >= kUnstickReverseMaxTicks;
+    if (unhooked || reverse_timeout) {
+        RCLCPP_INFO(
+            node_.get_logger(),
+            "Unstick: forward push (reversed %.2f m tilt=%.1f deg)",
+            moved,
+            tilt * kRadToDeg
+        );
+        BeginUnstickPhase(UnstickPhase::Drive, pose, tilt);
+        cmd.twist.linear.x = kUnstickDriveSpeed;
+        cmd.twist.angular.z = SteerOffLip(heading_error, act_wz, cte);
+    }
+}
+
+// Forward push off the lip; leave Unstick when clear, or reverse again if still hung.
+void ArduroverController::TickUnstickDrive(
+    const Waypoint &pose,
+    double act_vx,
+    double act_wz,
+    double heading_error,
+    double cte,
+    double tilt,
+    double moved,
+    bool tilt_falling,
+    bool heading_clear,
+    geometry_msgs::msg::TwistStamped &cmd
+) {
+    cmd.twist.linear.x = kUnstickDriveSpeed;
+    cmd.twist.angular.z = SteerOffLip(heading_error, act_wz, cte);
+    // XY motion alone is not "free" — last run left at he=-28° and rammed
+    // the same lip. Resume only once the long carrot is roughly ahead.
+    if (unstickTicks_ >= kUnstickMinTicks && moved >= kUnstickDriveM && heading_clear) {
+        LeaveUnstick();
+        return;
+    }
+    if (unstickTicks_ >= kUnstickDriveTicks && !tilt_falling) {
+        if (heading_clear && moved >= 0.12) {
+            LeaveUnstick();
+            return;
+        }
+        // Already rolling (hairpin orbit, not a hang). Reverse-wiggle here
+        // is what threw path 2 i=103 into a 2 m circle.
+        if (std::hypot(act_vx, act_wz) > kSeenMotionVel) {
+            LeaveUnstick();
+            return;
+        }
+        if (unstickAttempt_ + 1 >= kUnstickMaxAttempts) {
+            RCLCPP_WARN(
+                node_.get_logger(), "Unstick gave up after %d cycles (moved %.2f m)", unstickAttempt_ + 1, moved
+            );
+            LeaveUnstick();
+            return;
+        }
+        ++unstickAttempt_;
+        RCLCPP_INFO(node_.get_logger(), "Unstick: reverse wiggle again (fwd moved %.2f m he=%.1f deg)", moved,
+                    heading_error * kRadToDeg);
+        BeginUnstickPhase(UnstickPhase::Reverse, pose, tilt);
+        cmd.twist.linear.x = -kUnstickReverseSpeed;
+        cmd.twist.angular.z = unstickWiggleSign_ * kMaxYawRate;
+    }
+}
+
+// Start Unstick if we have been commanding and frozen on XY.
+void ArduroverController::MaybeEnterUnstick(
+    const Waypoint &pose,
+    double act_vx,
+    double act_wz,
+    double heading_error,
+    double cte,
+    double tilt,
+    geometry_msgs::msg::TwistStamped &cmd
+) {
     if (unstickCooldownTicks_ > 0) {
         --unstickCooldownTicks_;
         stuckTicks_ = 0;
@@ -317,27 +360,37 @@ void ArduroverController::UpdateCuspMode(const Waypoint &pose) {
     }
 }
 
-// One tick: step the current segment, start a cusp maneuver if we just
-// arrived at a fold, then steer with the carrot (or the Turn yaw target).
+// One 20 Hz tick. Order matters: where we are on the polyline, then which
+// maneuver we are in, then the carrot, then BODY_NED vx/wz, then unstick may
+// overwrite the command if we are hung on a lip.
 void ArduroverController::Control(const nav_msgs::msg::Odometry &odometry) {
     const auto rpy = rpy_from_quat(odometry.pose.pose.orientation);
     Waypoint current_waypoint{odometry.pose.pose.position.x, odometry.pose.pose.position.y, rpy.yaw};
 
+    // 1. Progress: walk the current segment only (t > 1). Catch-up may skip a
+    //    Pass fold; it never jumps an End/Turn (overlapping rollback trap).
     progressIndex_ = advance_progress(current_waypoint, path_, progressIndex_);
+
+    // 2. Mode: if we just arrived at a fold, stop (recorded rollback) or enter
+    //    Turn (yaw-flip). If already turning, leave Turn once heading matches.
     UpdateCuspMode(current_waypoint);
 
     const std::size_t track_i = progressIndex_;
     const double track_t =
         (track_i + 1 < path_.size()) ? project_t(current_waypoint, path_[track_i], path_[track_i + 1]) : 1.0;
 
+    // Unstick steers with the mode we interrupted (Turn vs Forward).
     const DriveMode heading_mode = (driveMode_ == DriveMode::Unstick) ? preUnstickMode_ : driveMode_;
     const bool turning = heading_mode == DriveMode::Turn;
     const bool unsticking = driveMode_ == DriveMode::Unstick;
+
+    // 3. Carrot: look-ahead on this unfolding. Turn aims at recorded outgoing
+    //    yaw; Unstick uses a longer carrot; otherwise shorten it in a bend.
     const Pursuit pursuit =
         pursuit_target(path_, current_waypoint, track_i, track_t, turning, unsticking, turnTargetYaw_);
     const Waypoint &target = pursuit.target;
     const double heading_error = pursuit.heading_error;
-    const double turn = pursuit.turn;
+    const double bend = pursuit.bend;
 
     const double desired_heading = turning ? turnTargetYaw_
                                            : std::atan2(target.y - current_waypoint.y, target.x - current_waypoint.x);
@@ -352,18 +405,23 @@ void ArduroverController::Control(const nav_msgs::msg::Odometry &odometry) {
     cmd.header.stamp = node_.now();
     cmd.header.frame_id = "base_link";
 
-    // Finish is the last vertex of this unfolding, not crow-flies to path.back()
-    // (path 0's reverse tail is itself ~1 m and is a stop, not leftover length).
+    // 4. Stop rule: last vertex of this unfolding, not crow-flies to path.back()
+    //    (path 0's reverse tail is itself ~1 m and is a stop, not leftover length).
     if (!finished_ && at_polyline_end(path_, progressIndex_, track_t)) {
         finished_ = true;
     }
     const bool at_goal = finished_;
+
+    // 5. Tracking command: zeros if finished; else cruise bled into the end /
+    //    next hard cusp, and PD yaw. |ψe| large → vx=0 (spin, do not drive off).
     if (!at_goal) {
         cmd.twist.linear.x =
-            tracking_speed(path_, current_waypoint, track_i, remaining, turning, turn, heading_error);
+            tracking_speed(path_, current_waypoint, track_i, remaining, turning, bend, heading_error);
         cmd.twist.angular.z = heading_yaw_cmd(heading_error, yaw_rate);
     }
 
+    // 6. Recovery may replace vx/wz (reverse wiggle, then forward). Tracking
+    //    cmd is still computed first so stuck-detect can see what we asked for.
     RecoverStuck(
         current_waypoint,
         odometry.twist.twist.linear.x,
@@ -381,6 +439,7 @@ void ArduroverController::Control(const nav_msgs::msg::Odometry &odometry) {
                                                                       : 2;
     const bool wz_sat = !at_goal && std::abs(heading_yaw_pd(heading_error, yaw_rate)) > kMaxYawRate + 1e-9;
 
+    // 7. Always publish (GUIDED wants a stream). Zeros if at_goal and not unsticking.
     velocityPublisher_->publish(cmd);
 
     if (logFile_.is_open()) {
