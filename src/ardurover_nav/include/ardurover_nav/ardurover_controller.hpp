@@ -43,8 +43,11 @@ class ArduroverController {
         geometry_msgs::msg::TwistStamped& cmd
     );
     void LeaveUnstick();
+    // Enter Turn at a yaw-flip cusp, or latch finished_ on a recorded rollback tail.
     void UpdateCuspMode(const Waypoint& pose);
+    // Reset the unstick timer and pose/tilt anchors when Reverse or Drive starts.
     void BeginUnstickPhase(UnstickPhase phase, const Waypoint& pose, double tilt);
+    // Yaw command while driving off a lip: PD on heading, mixed toward the path if CTE is large.
     double SteerOffLip(double heading_error, double act_wz, double cte) const;
 
     rclcpp::Node& node_;

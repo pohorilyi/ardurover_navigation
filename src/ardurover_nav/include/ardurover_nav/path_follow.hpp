@@ -60,10 +60,12 @@ constexpr double kSeenMotionVel = 0.20;     // have we ever really moved this ru
 constexpr double kTurnInPlaceRad = 0.85;    // |ψe| above this → vx=0 (do not drive off the curb)
 constexpr double kTiltRad = 0.10;           // ~6 deg: chassis on a lip (roll/pitch)
 
+// XY distance between two path samples. Yaw is ignored.
 inline double distance(const Waypoint &a, const Waypoint &b) {
     return std::hypot(a.x - b.x, a.y - b.y);
 }
 
+// Chord length of segment i → i+1. Zero if i is the last sample.
 inline double segment_length(const std::vector<Waypoint> &path, std::size_t i) {
     if (i + 1 >= path.size()) {
         return 0.0;
@@ -107,6 +109,7 @@ inline std::optional<Tangent> incoming_tangent(const std::vector<Waypoint> &path
     return std::nullopt;
 }
 
+// First non-tiny chord leaving vertex toward later samples.
 inline std::optional<Tangent> outgoing_tangent(const std::vector<Waypoint> &path, std::size_t vertex) {
     for (std::size_t i = vertex + 1; i < path.size(); ++i) {
         const double dx = path[i].x - path[vertex].x;
@@ -119,6 +122,7 @@ inline std::optional<Tangent> outgoing_tangent(const std::vector<Waypoint> &path
     return std::nullopt;
 }
 
+// Cosine of the angle between two chords. −1 means they point opposite ways.
 inline double tangent_dot(const Tangent &a, const Tangent &b) {
     return (a.dx * b.dx + a.dy * b.dy) / (a.len * b.len);
 }
@@ -178,6 +182,7 @@ inline bool is_hard_cusp(const std::vector<Waypoint> &path, std::size_t vertex) 
     return is_cusp_at_vertex(path, vertex) && classify_cusp(path, vertex) != CuspKind::Pass;
 }
 
+// First End/Turn cusp after from_seg. Pass folds are not a speed-bleed wall.
 inline std::optional<std::size_t> next_hard_cusp_vertex(const std::vector<Waypoint> &path, std::size_t from_seg) {
     const std::size_t start = from_seg + 1;
     for (std::size_t v = start; v + 1 < path.size(); ++v) {
@@ -251,6 +256,7 @@ inline bool arrived_at_vertex(
     return project_t(pose, path[vertex - 1], path[vertex]) >= 1.0 - kSegPastEps;
 }
 
+// Point on chord a→b. Yaw is wrapped so 179° vs −179° interpolates as a small turn.
 inline Waypoint interpolate(const Waypoint &a, const Waypoint &b, double t) {
     t = std::clamp(t, 0.0, 1.0);
     return {a.x + t * (b.x - a.x), a.y + t * (b.y - a.y), wrap(a.yaw + t * wrap(b.yaw - a.yaw))};
@@ -341,10 +347,12 @@ inline double heading_yaw_pd(double heading_error, double yaw_rate) {
     return kHeadingP * heading_error - kHeadingD * rate;
 }
 
+// Saturated BODY_NED yaw rate from heading_yaw_pd.
 inline double heading_yaw_cmd(double heading_error, double yaw_rate) {
     return std::clamp(heading_yaw_pd(heading_error, yaw_rate), -kMaxYawRate, kMaxYawRate);
 }
 
+// Signed heading error to a point, wrapped to (−π, π]. BODY_NED uses this as ψe.
 inline double heading_toward(const Waypoint &pose, const Waypoint &to) {
     return wrap(std::atan2(to.y - pose.y, to.x - pose.x) - pose.yaw);
 }
@@ -384,6 +392,7 @@ inline std::size_t advance_progress(
     return catch_up_progress(pose, path, progress);
 }
 
+// Carrot and heading used for one Control() tick. `turn` is 0..1 look-ahead tightness.
 struct Pursuit {
     Waypoint target{};
     double heading_error{0.0};
@@ -444,6 +453,8 @@ inline Pursuit pursuit_target(
     return out;
 }
 
+// Forward vx for this tick: cruise, bled into the end / next hard cusp, zero if
+// heading is too far off to drive (spin in place instead).
 inline double tracking_speed(
     const std::vector<Waypoint> &path,
     const Waypoint &pose,

@@ -121,6 +121,7 @@ void ArduroverController::LeaveUnstick() {
     unstickCooldownTicks_ = kUnstickCooldownTicks;
 }
 
+// Reset the unstick timer and pose/tilt anchors when Reverse or Drive starts.
 void ArduroverController::BeginUnstickPhase(UnstickPhase phase, const Waypoint &pose, double tilt) {
     unstickPhase_ = phase;
     unstickTicks_ = 0;
@@ -130,6 +131,7 @@ void ArduroverController::BeginUnstickPhase(UnstickPhase phase, const Waypoint &
     unstickWiggleSign_ = 1.0;
 }
 
+// Yaw command while driving off a lip: PD on heading, mixed toward the path if CTE is large.
 double ArduroverController::SteerOffLip(double heading_error, double act_wz, double cte) const {
     double wz = heading_yaw_cmd(heading_error, act_wz);
     if (std::abs(cte) > 0.15) {
@@ -285,6 +287,7 @@ void ArduroverController::RecoverStuck(
     );
 }
 
+// Enter Turn at a yaw-flip cusp, or latch finished_ on a recorded rollback tail.
 void ArduroverController::UpdateCuspMode(const Waypoint &pose) {
     const std::size_t closest_i = progressIndex_;
 
