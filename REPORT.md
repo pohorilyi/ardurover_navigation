@@ -44,46 +44,46 @@ $$
 
 ## Look-ahead (carrot)
 
-Default look-ahead is $L_0 = 1.4\,\mathrm{m}$. The carrot is interpolated along remaining chord length, and it **stops at the next hard cusp** so a 1.4 m look-ahead cannot sit on a recorded rollback.
+Default look-ahead is $L_0 = 1.4$ m. The carrot is interpolated along remaining chord length, and it **stops at the next hard cusp** so a 1.4 m look-ahead cannot sit on a recorded rollback.
 
 Heading error is the wrapped bearing to the carrot:
 
 $$
-\psi_d = \operatorname{atan2}(y_t - y,\, x_t - x), \qquad
-\psi_e = \operatorname{wrap}(\psi_d - \psi) \in (-\pi,\pi].
+\psi_d = \mathrm{atan2}(y_t - y, x_t - x), \qquad
+\psi_e = \mathrm{wrap}(\psi_d - \psi) \in (-\pi,\pi].
 $$
 
 In a bend the carrot is shortened so the rover does not cut vertices:
 
 $$
-\beta = \mathrm{clip}\!\left(\frac{|\psi_e|}{0.7},\, 0,\, 1\right), \qquad
-L = L_0 + (0.6 - L_0)\,\beta.
+\beta = \mathrm{clip}\left(\frac{\vert\psi_e\vert}{0.7}, 0, 1\right), \qquad
+L = L_0 + (0.6 - L_0)\beta.
 $$
 
-If the carrot still lies behind the rover ($|\psi_e| > \pi/2$), $L$ is grown in 0.5 m steps until the target is in the front half-plane. Unstick uses a longer carrot ($L = 2.8\,\mathrm{m}$) without advancing $i$.
+If the carrot still lies behind the rover ($\vert\psi_e\vert > \pi/2$), $L$ is grown in 0.5 m steps until the target is in the front half-plane. Unstick uses a longer carrot ($L = 2.8$ m) without advancing $i$.
 
 ## Yaw command (PD)
 
 Yaw rate is PD on heading error, damped with **measured** yaw rate rather than $\dot{\psi}_e$. Differentiating the carrot bearing is noisy and pumps weave.
 
 $$
-\omega_{\mathrm{pd}} = K_p\,\psi_e - K_d\,\omega_{\mathrm{meas}}, \qquad
-\omega_z = \mathrm{clip}(\omega_{\mathrm{pd}},\, -\omega_{\max},\, \omega_{\max})
+\omega_{\mathrm{pd}} = K_p \psi_e - K_d \omega_{\mathrm{meas}}, \qquad
+\omega_z = \mathrm{clip}(\omega_{\mathrm{pd}}, -\omega_{\max}, \omega_{\max})
 $$
 
-with $K_p = 1.0$, $K_d = 0.08$, $\omega_{\max} = 0.6\,\mathrm{rad/s}$. There is no integral term: GUIDED already holds a rate command, and an integrator on $\psi_e$ would wind up against saturation and against a hung wheel.
+with $K_p = 1.0$, $K_d = 0.08$, $\omega_{\max} = 0.6$ rad/s. There is no integral term: GUIDED already holds a rate command, and an integrator on $\psi_e$ would wind up against saturation and against a hung wheel.
 
 ## Forward speed
 
-Cruise is $v_c = 1.0\,\mathrm{m/s}$. Speed is scaled by remaining polyline length $s_{\mathrm{rem}}$ (4 m bleed) and by distance to the next hard cusp (1.5 m bleed, floor 0.3), then by the bend factor:
+Cruise is $v_c = 1.0$ m/s. Speed is scaled by remaining polyline length $s_{\mathrm{rem}}$ (4 m bleed) and by distance to the next hard cusp (1.5 m bleed, floor 0.3), then by the bend factor:
 
 $$
-s_{\mathrm{end}} = \mathrm{clip}(s_{\mathrm{rem}}/4,\, 0,\, 1), \qquad
-s_{\mathrm{bend}} = 1 - (1-0.35)\,\beta, \qquad
+s_{\mathrm{end}} = \mathrm{clip}(s_{\mathrm{rem}}/4, 0, 1), \qquad
+s_{\mathrm{bend}} = 1 - (1-0.35)\beta, \qquad
 v_x = v_c\, s_{\mathrm{end}}\, s_{\mathrm{bend}}.
 $$
 
-If $|\psi_e| > 0.85\,\mathrm{rad}$ (~49°), $v_x = 0$: spin in place rather than drive off the pathwalk. At a heading-180 cusp, $v_x = 0.15\,\mathrm{m/s}$ (creep) while the PD loop aligns yaw.
+If $\vert\psi_e\vert > 0.85$ rad (~49°), $v_x = 0$: spin in place rather than drive off the pathwalk. At a heading-180 cusp, $v_x = 0.15$ m/s (creep) while the PD loop aligns yaw.
 
 The stop condition is the **end of the current unfolding** (last vertex, or last segment with $t \ge 1$), not crow-flies distance to `path.back()`. Once latched, the controller publishes zeros and stays stopped.
 
@@ -94,17 +94,17 @@ A vertex is a cusp when incoming and outgoing tangents satisfy $\hat{\mathbf{t}}
 | Kind | Recording | Action |
 |---|---|---|
 | **End** | Yaw unchanged, XY after the fold goes the other way (~1 m rollback on paths 0/1) | Stop. Do not track the reverse tail. |
-| **Turn** | Recorded yaw flips ~180° | Enter Turn: $\psi_e = \operatorname{wrap}(\psi_{\mathrm{out}} - \psi)$, creep $v_x$, leave when $\lvert\psi_e\rvert < 0.25\,\mathrm{rad}$. |
+| **Turn** | Recorded yaw flips ~180° | Enter Turn: $\psi_e = \mathrm{wrap}(\psi_{\mathrm{out}} - \psi)$, creep $v_x$, leave when $\vert\psi_e\vert < 0.25$ rad. |
 | **Pass** | Small recorded wiggle | Drive through; carrot and progress ignore it as a wall. |
 
 ## Unstick (boardwalk hang)
 
 If the rover has already moved this run, is commanding motion, has small heading error, and XY/body rates stay frozen for 1.5 s, the tracker is interrupted:
 
-1. **Reverse** ($v_x = -0.45\,\mathrm{m/s}$): alternate $\omega_z = \pm\omega_{\max}$ every 0.4 s so left then right wheels take the load. Continue at least 2 s, then until 0.30 m of reverse or 4 s timeout.
-2. **Drive** ($v_x = 0.55\,\mathrm{m/s}$): PD on heading, mixed 50/50 toward the path if $\lvert e_{\mathrm{cte}}\rvert > 0.15\,\mathrm{m}$. Leave when ~0.40 m of forward motion and heading is within ~23°, or after 2 s if already rolling / tilt is falling / attempts exhausted (max 4 reverse→drive cycles).
+1. **Reverse** ($v_x = -0.45$ m/s): alternate $\omega_z = \pm\omega_{\max}$ every 0.4 s so left then right wheels take the load. Continue at least 2 s, then until 0.30 m of reverse or 4 s timeout.
+2. **Drive** ($v_x = 0.55$ m/s): PD on heading, mixed 50/50 toward the path if $\vert e_{\mathrm{cte}}\vert > 0.15$ m. Leave when ~0.40 m of forward motion and heading is within ~23°, or after 2 s if already rolling / tilt is falling / attempts exhausted (max 4 reverse→drive cycles).
 
-A 1.5 s cooldown prevents retriggering. Intentional in-place turns ($|\psi_e| > 0.85\,\mathrm{rad}$) are not treated as hangs.
+A 1.5 s cooldown prevents retriggering. Intentional in-place turns ($\vert\psi_e\vert > 0.85$ rad) are not treated as hangs.
 
 ## Tick order
 
