@@ -415,14 +415,16 @@ inline Pursuit pursuit_target(
     // Circling the hairpin apex: carrot is behind (|ψe|>90°), vx=0 spin, orbit.
     // Walk the same polyline forward until the target is in the front half-plane.
     if (!turning && std::abs(out.heading_error) > kPi / 2) {
-        double L = std::max(out.lookahead_m, kLookaheadM);
+        // Meters along the path to the carrot. Start at the current look-ahead
+        // and step it out until that point is in front of the rover.
+        double lookahead_m = std::max(out.lookahead_m, kLookaheadM);
         for (int step = 0; step < 10; ++step) {
-            L += 0.5;
-            const Waypoint cand = lookahead_waypoint(path, track_i, track_t, L);
+            lookahead_m += 0.5;
+            const Waypoint cand = lookahead_waypoint(path, track_i, track_t, lookahead_m);
             const double he = heading_toward(pose, cand);
             out.target = cand;
             out.heading_error = he;
-            out.lookahead_m = L;
+            out.lookahead_m = lookahead_m;
             if (std::abs(he) < kPi / 2) {
                 break;
             }

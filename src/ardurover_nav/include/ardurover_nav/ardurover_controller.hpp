@@ -32,6 +32,11 @@ class ArduroverController {
     void OnState(const mavros_msgs::msg::State& msg);
     void RequestGuided();
     void RequestArm();
+    // Unstick map. Control() fills cmd, then calls RecoverStuck, which does one of:
+    //   at goal            → cancel
+    //   already Unstick    → TickUnstickReverse or TickUnstickDrive (overwrites cmd)
+    //   else               → MaybeEnterUnstick (may switch to Reverse and overwrite cmd)
+    // LeaveUnstick restores preUnstickMode_ (Forward or Turn). Path index is not moved here.
     void RecoverStuck(
         const Waypoint& pose,
         double act_vx,

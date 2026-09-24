@@ -154,9 +154,12 @@ void ArduroverController::RecoverStuck(
     bool at_goal,
     geometry_msgs::msg::TwistStamped &cmd
 ) {
+    // Latch once the body has really moved. hypot(m/s, rad/s) is a cutoff, not a speed.
+    // Blocks the GUIDED startup pause from looking like a hang.
     if (std::hypot(act_vx, act_wz) > kSeenMotionVel) {
         seenMotion_ = true;
     }
+    // Branch 1: finished. Do not recover; published cmd stays zero.
     if (at_goal) {
         stuckTicks_ = 0;
         if (driveMode_ == DriveMode::Unstick) {
@@ -167,6 +170,7 @@ void ArduroverController::RecoverStuck(
 
     const double tilt = std::hypot(roll, pitch);
 
+    // Branch 2: recovery already running. Only vx/wz change; progress index does not.
     if (driveMode_ == DriveMode::Unstick) {
         ++unstickTicks_;
         const double moved = std::hypot(pose.x - unstickStartX_, pose.y - unstickStartY_);
@@ -183,6 +187,7 @@ void ArduroverController::RecoverStuck(
         return;
     }
 
+    // Branch 3: not recovering. Maybe start Reverse.
     MaybeEnterUnstick(pose, act_vx, act_wz, heading_error, cte, tilt, cmd);
 }
 
@@ -234,23 +239,26 @@ void ArduroverController::TickUnstickDrive(
 ) {
     cmd.twist.linear.x = kUnstickDriveSpeed;
     cmd.twist.angular.z = SteerOffLip(heading_error, act_wz, cte);
-    // XY motion alone is not "free" — last run left at he=-28° and rammed
-    // the same lip. Resume only once the long carrot is roughly ahead.
+    // Exit A (happy path, after 0.4 s): far enough forward and carrot roughly ahead.
+    // XY motion alone is not "free" — last run left at he=-28° and rammed the same lip.
     if (unstickTicks_ >= kUnstickMinTicks && moved >= kUnstickDriveM && heading_clear) {
         LeaveUnstick();
         return;
     }
+    // Exits B–D open only after 2 s, and only if tilt is not still dropping.
     if (unstickTicks_ >= kUnstickDriveTicks && !tilt_falling) {
+        // Exit B: heading clear and a smaller forward gain.
         if (heading_clear && moved >= 0.12) {
             LeaveUnstick();
             return;
         }
-        // Already rolling (hairpin orbit, not a hang). Reverse-wiggle here
-        // is what threw path 2 i=103 into a 2 m circle.
+        // Exit C: already rolling (hairpin orbit, not a hang). Another reverse
+        // threw path 2 i=103 into a 2 m circle.
         if (std::hypot(act_vx, act_wz) > kSeenMotionVel) {
             LeaveUnstick();
             return;
         }
+        // Exit D: four cycles used up. Resume even if still hung.
         if (unstickAttempt_ + 1 >= kUnstickMaxAttempts) {
             RCLCPP_WARN(
                 node_.get_logger(), "Unstick gave up after %d cycles (moved %.2f m)", unstickAttempt_ + 1, moved
@@ -258,6 +266,7 @@ void ArduroverController::TickUnstickDrive(
             LeaveUnstick();
             return;
         }
+        // Still hung: another Reverse → Drive cycle.
         ++unstickAttempt_;
         RCLCPP_INFO(node_.get_logger(), "Unstick: reverse wiggle again (fwd moved %.2f m he=%.1f deg)", moved,
                     heading_error * kRadToDeg);
@@ -277,21 +286,25 @@ void ArduroverController::MaybeEnterUnstick(
     double tilt,
     geometry_msgs::msg::TwistStamped &cmd
 ) {
+    // Not a hang: cooldown after the last recovery.
     if (unstickCooldownTicks_ > 0) {
         --unstickCooldownTicks_;
         stuckTicks_ = 0;
         return;
     }
+    // Not a hang: GUIDED startup, body has never rolled this run.
     if (!seenMotion_) {
         stuckTicks_ = 0;
         return;
     }
-    // Intentional in-place turn (carrot was behind) is not a boardwalk hang.
+    // Not a hang: intentional in-place spin (carrot behind, |ψe| > 0.85 rad).
     if (std::abs(heading_error) > kTurnInPlaceRad) {
         stuckTicks_ = 0;
         return;
     }
 
+    // Hang = we asked for motion and the measured body speed is ~0.
+    // cmd is the tracker command; act_* is /ground_truth/odom.
     const bool commanding =
         std::abs(cmd.twist.linear.x) > kStuckCmdVx || std::abs(cmd.twist.angular.z) > kStuckCmdWz;
     const bool not_moving = std::abs(act_vx) < kStuckActVx && std::abs(act_wz) < kStuckActWz;
@@ -303,6 +316,7 @@ void ArduroverController::MaybeEnterUnstick(
         stuckAnchorX_ = pose.x;
         stuckAnchorY_ = pose.y;
     }
+    // Drifted: this is motion, so restart the 1.5 s window.
     if (std::hypot(pose.x - stuckAnchorX_, pose.y - stuckAnchorY_) > kStuckPoseM) {
         stuckTicks_ = 0;
         stuckAnchorX_ = pose.x;
